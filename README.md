@@ -1,6 +1,8 @@
-## 🚀 Bot-hosting 自动续期（GitHub Actions）
+## 🚀 Bot-hosting 自动续期（Cloudflare Workers + GitHub Actions）
 
-这是一个基于 GitHub Actions 的自动化脚本，用于定时登录自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
+这是一个基于 Cloudflare Workers 触发 GitHub Actions 的自动化脚本，用于登录并自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
+
+GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudflare Worker，Action 只保留 Cloudflare 触发和手动运行。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -23,7 +25,23 @@
 
 2：在`setting`➡`secrets and variables`➡`Actions` 里添加上方必填的secrets
 
-3：去actions菜单手动试运行工作流,根据自己的服务到期日期自行在[renew.yml](.github/workflows/renew.yml)里调整cron运行时间
+3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署
+
+4：在 Cloudflare Worker 的 Variables / Secrets 里添加以下变量
+
+| 变量名称         | 是否必填 | 说明 |
+|------------------|----------|------|
+| GH_PAT           | ✅ 必填  | GitHub Personal Access Token，用于触发 repository_dispatch |
+| GH_USER          | ✅ 必填  | GitHub 用户名，例如 `karlxu11` |
+| GH_REPO          | ✅ 必填  | 当前仓库名，例如 `Auto-Renew-Bothosting` |
+| AUTH_KEY         | ✅ 必填  | 手动触发密钥，访问 `https://你的Worker域名/?key=AUTH_KEY` 时使用 |
+| GH_EVENT_TYPE    | ❌ 可选  | 默认 `cf_timer`，需和 workflow 中 `repository_dispatch.types` 一致 |
+| TG_BOT_TOKEN     | ❌ 可选  | Telegram Bot Token，Worker 触发 GitHub Action 后通知 |
+| TG_CHAT_ID       | ❌ 可选  | Telegram Chat ID |
+
+5：在 Cloudflare Worker 里添加 Cron Trigger，例如 `12 0 * * *`
+
+6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action
 
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
@@ -58,7 +76,7 @@
 * 必填变量必须要填写
 * NODE_LINK支持的代理协议有：vmess,vless,hysteria2,tuic,anytls,socks5等
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
-* cron运行时间不一定准确,得根据实际到期时间修改,可在设置里暂停actions功能再开启
+* GitHub Actions 的定时已取消，定时触发由 Cloudflare Worker 的 Cron Trigger 负责
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。

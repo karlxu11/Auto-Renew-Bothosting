@@ -1,8 +1,11 @@
 name: Auto Renew Bot-hosting
 
 on:
-  schedule:
-    - cron: '0 1 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+  # Cloudflare Workers 通过 repository_dispatch 触发这个事件
+  repository_dispatch:
+    types: [cf_timer]
+
+  # 保留 GitHub 网页上的手动运行入口
   workflow_dispatch:
 
 jobs:
@@ -42,7 +45,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run --auto-servernum python3 app.py
+          set -o pipefail
+          xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log
 
       - name: 🧽 清理进程和临时文件
         if: always()
@@ -67,3 +71,10 @@ jobs:
               gh run delete $run_id || true
             fi
           done
+
+      - name: 📦 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-log
+          path: renew.log
