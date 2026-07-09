@@ -66,7 +66,7 @@ jobs:
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt 10 ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
