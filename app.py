@@ -167,6 +167,7 @@ def extract_expiry_date(page_source: str) -> str:
         r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
         r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
         r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
     ]
     for pattern in patterns:
         match = re.search(pattern, page_source)
@@ -181,15 +182,7 @@ def extract_expiry_date(page_source: str) -> str:
             return date_str
     return None
 
-# ============================================================
 #   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
-#
-#   流程：
-#   1. 浏览器打开 /login/discord，从落地页 URL 提取 state
-#   2. 携带 DC_TOKEN 直接 POST 到 Discord OAuth2/authorize 完成授权
-#   3. 浏览器打开返回的回调 URL，完成登录
-# ============================================================
-
 DISCORD_CLIENT_ID   = "884382422530158623"
 OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
 OAUTH_SCOPE         = "identify email guilds"
@@ -433,10 +426,11 @@ def main():
             send_telegram_message(format_notification("❌ 登录失败", error=error_msg))
             return
 
-        if _LOGIN_METHOD == "Discord OAuth":
+        if _LOGIN_METHOD == "Discord Token":
             print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
 
         # 提取当前到期日期
+        sb.sleep(2)
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
         if current_expiry:
@@ -449,6 +443,7 @@ def main():
         countdown_text = None
         possible_selectors = [
             'button:contains("Renew")',
+            'button:contains("Renew free plan")',
             'a:contains("Renew")',
             '[class*="renew"]',
             '[class*="Renew"]',
@@ -474,8 +469,9 @@ def main():
         if outer_renew_selector:
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
+                sb.sleep(2)
                 sb.click(outer_renew_selector)
-                sb.sleep(10)  # 等待模态框加载
+                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
@@ -487,7 +483,7 @@ def main():
             for attempt in range(1, 4):
                 try:
                     sb.uc_gui_click_captcha()
-                    time.sleep(10)
+                    time.sleep(12)
                 except Exception as e:
                     print(f"⚠️ 点击 Turnstile 出错: {e}")
 
@@ -515,7 +511,7 @@ def main():
                 print(f"续期按钮点击失败: {e}")
 
             print("⏳ 等待新的过期时间...")
-            sb.sleep(5)
+            sb.sleep(6)
 
             # 提取新的到期日期和倒计时
             new_page_text = sb.get_page_source()
