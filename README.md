@@ -4,6 +4,8 @@
 
 GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudflare Worker，Action 只保留 Cloudflare 触发和手动运行。
 
+⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
+
 ━━━━━━━━━━━━━━━━━━━━━━
 
 ### 🔐 Secrets 配置说明
