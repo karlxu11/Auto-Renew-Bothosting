@@ -160,6 +160,18 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
+# 将本次账单页读取到的到期日传给 GitHub Actions。GitHub Actions 再使用
+# Cloudflare API 把 Worker 的下一次 Cron 设置为到期日前一天。
+def set_github_output(name: str, value: str):
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path or not value:
+        return
+    try:
+        with open(output_path, "a", encoding="utf-8") as output_file:
+            output_file.write(f"{name}={value}\n")
+    except OSError as e:
+        print(f"⚠️ 无法写入 GitHub Actions 输出 {name}: {e}")
+
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
@@ -433,6 +445,7 @@ def main():
         sb.sleep(2)
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
+        schedule_expiry = current_expiry
         if current_expiry:
             print(f"📅 当前到期日期: {current_expiry}")
         else:
@@ -522,6 +535,7 @@ def main():
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
                 if new_expiry:
                     print(f"📅 新的到期日期: {new_expiry}")
+                    schedule_expiry = new_expiry
                 send_telegram_message(
                     format_notification(
                         "✅ 续期成功",
@@ -532,6 +546,7 @@ def main():
             else:
                 if new_expiry and new_expiry != current_expiry:
                     print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+                    schedule_expiry = new_expiry
                     send_telegram_message(
                         format_notification(
                             "✅ 续期成功",
@@ -569,6 +584,12 @@ def main():
                         expiry_date=current_expiry or "（未获取到）"
                     )
                 )
+
+        if schedule_expiry:
+            set_github_output("expiry_date", schedule_expiry)
+            print(f"🗓️ 已输出下次 Cloudflare 排程依据的到期日: {schedule_expiry}")
+        else:
+            print("⚠️ 未获取到到期日期，保留现有 Cloudflare 定时任务")
 
         # 更新SESSION_TOKEN 
         print("🔄 检查 SESSION_TOKEN 是否需要更新")

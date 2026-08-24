@@ -27,7 +27,7 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 
 2：在`setting`➡`secrets and variables`➡`Actions` 里添加上方必填的secrets
 
-3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署
+3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署。
 
 4：在 Cloudflare Worker 的 Variables / Secrets 里添加以下变量
 
@@ -41,7 +41,15 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 | TG_BOT_TOKEN     | ❌ 可选  | Telegram Bot Token，Worker 触发 GitHub Action 后通知 |
 | TG_CHAT_ID       | ❌ 可选  | Telegram Chat ID |
 
-5：在 Cloudflare Worker 里添加 Cron Trigger，例如 `12 0 * * *`
+5：在 GitHub 仓库的 `Settings → Secrets and variables → Actions` 添加以下 Secrets，使每次运行后能自动设置下一次 Cloudflare 定时任务：
+
+| Secret 名称 | 说明 |
+|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `CLOUDFLARE_WORKER_NAME` | 已部署 Worker 的名称 |
+| `CLOUDFLARE_API_TOKEN` | 创建一个仅限该账户、权限为 `Workers Scripts: Edit` 的 API Token |
+
+脚本读取到账单页的到期日后，会把该 Worker 的唯一 Cron 设置为**到期日前一天 23:00（北京时间）**。例如到期日是 `2026/08/27`，将设置为 `2026/08/26 23:00`。未读到到期日或 Cloudflare 凭据未配置时，会保留原有定时任务。
 
 6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action
 
@@ -78,7 +86,7 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 * 必填变量必须要填写
 * NODE_LINK支持的代理协议有：vmess,vless,hysteria2,tuic,anytls,socks5等
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
-* GitHub Actions 的定时已取消，定时触发由 Cloudflare Worker 的 Cron Trigger 负责
+* GitHub Actions 的定时已取消；脚本每次运行成功后，会按页面到期日自动更新 Cloudflare Worker 的唯一 Cron Trigger
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。

@@ -38,6 +38,7 @@ jobs:
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🚀 运行续期脚本
+        id: renew
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -48,6 +49,37 @@ jobs:
         run: |
           set -o pipefail
           xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log
+
+      - name: 🗓️ 设置下次 Cloudflare 续期时间
+        if: steps.renew.outputs.expiry_date != ''
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
+          EXPIRY_DATE: ${{ steps.renew.outputs.expiry_date }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_WORKER_NAME" ]; then
+            echo "::warning::未配置 Cloudflare API 凭据，跳过更新定时任务。"
+            exit 0
+          fi
+
+          schedule_date=$(date --date="$EXPIRY_DATE -1 day" +%F)
+          # Cloudflare Cron 以 UTC 运行：15:00 UTC 即北京时间 23:00。
+          cron=$(date --date="$schedule_date" '+0 15 %-d %-m *')
+          payload=$(jq -nc --arg cron "$cron" '[{cron: $cron}]')
+
+          echo "将 ${CLOUDFLARE_WORKER_NAME} 的下一次任务设为 ${schedule_date} 23:00（北京时间；Cron: ${cron} UTC）"
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${CLOUDFLARE_WORKER_NAME}/schedules" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            | jq -e '.success == true' >/dev/null
+
+          echo "✅ Cloudflare 定时任务已更新"
 
       - name: 🧽 清理进程和临时文件
         if: always()
