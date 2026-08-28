@@ -49,7 +49,7 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 | `CLOUDFLARE_WORKER_NAME` | 已部署 Worker 的名称 |
 | `CLOUDFLARE_API_TOKEN` | 创建一个仅限该账户、权限为 `Workers Scripts: Edit` 的 API Token |
 
-脚本读取到账单页的到期日后，会把该 Worker 的唯一 Cron 设置为**到期日前一天 23:00（北京时间）**。例如到期日是 `2026/08/27`，将设置为 `2026/08/26 23:00`。未读到到期日或 Cloudflare 凭据未配置时，会保留原有定时任务。
+脚本读取到账单页的到期日后，会把该 Worker 的唯一 Cron 设置为**该日期 23:00（北京时间）**。例如到期日是 `2026/08/27`，将设置为 `2026/08/27 23:00`。未读到到期日或 Cloudflare 凭据未配置时，会保留原有定时任务。
 
 6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action
 

@@ -161,7 +161,7 @@ def format_countdown(countdown_str: str) -> str:
         return countdown_str
 
 # 将本次账单页读取到的到期日传给 GitHub Actions。GitHub Actions 再使用
-# Cloudflare API 把 Worker 的下一次 Cron 设置为到期日前一天。
+# Cloudflare API 把 Worker 的下一次 Cron 设置为该到期日。
 def set_github_output(name: str, value: str):
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path or not value:

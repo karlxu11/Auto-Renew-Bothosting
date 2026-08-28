@@ -65,7 +65,7 @@ jobs:
             exit 0
           fi
 
-          schedule_date=$(date --date="$EXPIRY_DATE -1 day" +%F)
+          schedule_date=$(date --date="$EXPIRY_DATE" +%F)
           # Cloudflare Cron 以 UTC 运行：15:00 UTC 即北京时间 23:00。
           cron=$(date --date="$schedule_date" '+0 15 %-d %-m *')
           payload=$(jq -nc --arg cron "$cron" '[{cron: $cron}]')
