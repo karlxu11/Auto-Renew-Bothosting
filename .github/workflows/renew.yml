@@ -66,11 +66,11 @@ jobs:
           fi
 
           schedule_date=$(date --date="$EXPIRY_DATE" +%F)
-          # Cloudflare Cron 以 UTC 运行：15:00 UTC 即北京时间 23:00。
-          cron=$(date --date="$schedule_date" '+0 15 %-d %-m *')
+          # Cloudflare Cron 以 UTC 运行：00:10 UTC 即北京时间 8:10。
+          cron=$(date --date="$schedule_date" '+10 0 %-d %-m *')
           payload=$(jq -nc --arg cron "$cron" '[{cron: $cron}]')
 
-          echo "将 ${CLOUDFLARE_WORKER_NAME} 的下一次任务设为 ${schedule_date} 23:00（北京时间；Cron: ${cron} UTC）"
+          echo "将 ${CLOUDFLARE_WORKER_NAME} 的下一次任务设为 ${schedule_date} 8:10（北京时间；Cron: ${cron} UTC）"
           curl --fail-with-body --silent --show-error \
             --request PUT \
             --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${CLOUDFLARE_WORKER_NAME}/schedules" \
