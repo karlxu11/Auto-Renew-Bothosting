@@ -1,8 +1,8 @@
 ## 🚀 Bot-hosting 自动续期（Cloudflare Workers + GitHub Actions）
 
-这是一个基于 Cloudflare Workers 触发 GitHub Actions 的自动化脚本，用于登录并自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
+这是一个基于 GitHub Actions 的自动化脚本，用于登录并自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
 
-GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudflare Worker，Action 只保留 Cloudflare 触发和手动运行。
+工作流支持 GitHub 每日定时触发、Cloudflare Worker 触发和手动触发。
 
 ⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
 
@@ -16,7 +16,6 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 | SESSION_TOKEN      | ❌ 可选  | Bot-hosting session_token，cookie里获取               |
 | DISCORD_TOKEN      | ✅ 必填  | Discord Token，SESSION_TOKEN失效时自动OAuth登录        |
 | GH_TOKEN           | ❌ 可选  | GitHub(classic) token,用于自动更新session_token,以ghp_xxx开头|
-| NODE_LINK          | ❌ 可选  | 代理链接（如 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// socks5:// )|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
 
@@ -49,9 +48,28 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 | `CLOUDFLARE_WORKER_NAME` | 已部署 Worker 的名称 |
 | `CLOUDFLARE_API_TOKEN` | 创建一个仅限该账户、权限为 `Workers Scripts: Edit` 的 API Token |
 
+## VPNGate SOCKS5 代理
+
+工作流会在 GitHub Actions 的 Ubuntu runner 中临时启动
+[vpngate-to-socks](https://github.com/shenyanshu/vpngate-to-socks)，自动连接 VPNGate
+节点并把 `socks5://127.0.0.1:10080` 提供给浏览器和 API 请求使用。
+
+- 默认只保留日本节点；
+- 默认排除节点名称中包含 `public` 的节点；
+- 自动探测 Bot-hosting 连通性，失败后自动切换节点；
+- 不再使用 `NODE_LINK` 或远程 sing-box 脚本。
+
+筛选条件可在 `.github/workflows/renew.yml` 的“启动 VPNGate SOCKS5 代理”步骤中修改：
+
+- `VPNGATE_COUNTRY`：国家代码，默认 `JP`；
+- `VPNGATE_EXCLUDE_KEYWORD`：节点名称排除关键词，默认 `public`。
+
+该方案依赖 GitHub Actions runner 的 Docker、`privileged` 和 `NET_ADMIN` 网络能力。
+SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
+
 脚本读取到账单页的到期日后，会把该 Worker 的唯一 Cron 设置为**该日期 23:00（北京时间）**。例如到期日是 `2026/08/27`，将设置为 `2026/08/27 23:00`。未读到到期日或 Cloudflare 凭据未配置时，会保留原有定时任务。
 
-6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action
+6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。GitHub 定时任务每天 UTC 00:02（北京时间 08:02）自动运行。
 
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
@@ -84,9 +102,9 @@ GitHub Actions 不再使用内置 `schedule` 定时；定时入口交给 Cloudfl
 
 ## 注意事项
 * 必填变量必须要填写
-* NODE_LINK支持的代理协议有：vmess,vless,hysteria2,tuic,anytls,socks5等
+* VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
-* GitHub Actions 的定时已取消；脚本每次运行成功后，会按页面到期日自动更新 Cloudflare Worker 的唯一 Cron Trigger
+* 脚本每次运行成功后，会按页面到期日自动更新 Cloudflare Worker 的 Cron Trigger；GitHub 每日定时仍然保留
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。

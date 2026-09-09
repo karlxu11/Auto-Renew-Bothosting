@@ -1,0 +1,31 @@
+diff --git a/internal/vpngate/selection.go b/internal/vpngate/selection.go
+index b96e9bd..4aa68e3 100644
+--- a/internal/vpngate/selection.go
++++ b/internal/vpngate/selection.go
+@@ -1,12 +1,25 @@
+ package vpngate
+ 
+ import (
++	"os"
+ 	"sort"
+ 	"strings"
+ )
+ 
+ // IsRecommendedServer reports whether a server is eligible for automatic/recommended connection.
+ // Servers without OpenVPN config, without any observed online users, or from RU are skipped.
+ func IsRecommendedServer(server Server) bool {
+-	return strings.TrimSpace(server.OpenVPNConfigDataBase64) != "" && server.TotalUsers > 0 && !strings.EqualFold(strings.TrimSpace(server.CountryShort), "RU")
++	if strings.TrimSpace(server.OpenVPNConfigDataBase64) == "" || server.TotalUsers <= 0 || strings.EqualFold(strings.TrimSpace(server.CountryShort), "RU") {
++		return false
++	}
++
++	if country := strings.TrimSpace(os.Getenv("VPNGATE_COUNTRY")); country != "" && !strings.EqualFold(strings.TrimSpace(server.CountryShort), country) {
++		return false
++	}
++
++	if keyword := strings.TrimSpace(os.Getenv("VPNGATE_EXCLUDE_KEYWORD")); keyword != "" && strings.Contains(strings.ToLower(server.HostName), strings.ToLower(keyword)) {
++		return false
++	}
++
++	return true
+ }

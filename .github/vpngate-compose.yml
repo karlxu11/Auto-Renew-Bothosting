@@ -1,0 +1,40 @@
+services:
+  vpngate-runner:
+    build:
+      context: ../vpngate-to-socks
+      dockerfile: Dockerfile
+    image: bothosting-vpngate-runner:ci
+    init: true
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    # OpenVPN 接管默认路由后，固定公共 DNS，避免容器注入的宿主机 DNS 超时。
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      RUNNER_CONTROL_ADDR: ":18081"
+      SOCKS_LISTEN_ADDR: "0.0.0.0:1080"
+      SOCKS_BYPASS_CIDRS: ""
+      AUTO_CONNECT: "true"
+      VPNGATE_COUNTRY: "${VPNGATE_COUNTRY:-JP}"
+      VPNGATE_EXCLUDE_KEYWORD: "${VPNGATE_EXCLUDE_KEYWORD:-public}"
+      MONITOR_URL: "https://bot-hosting.net/"
+      MONITOR_FAILURE_THRESHOLD: "3"
+      TCP_PROBE_ADDRESS: "bot-hosting.net:443"
+      TCP_PROBE_TIMEOUT: "5s"
+      OPENVPN_CONNECT_TIMEOUT: "35s"
+      MONITOR_INTERVAL: "20s"
+      MONITOR_TIMEOUT: "8s"
+      FETCH_TIMEOUT: "30s"
+      CONNECT_COOLDOWN: "5s"
+      MONITOR_STABLE_AFTER: "10s"
+      NODE_QUARANTINE: "10m"
+      BYPASS_ROUTE_TABLE: "100"
+      BYPASS_FWMARK: "1"
+    command: ["/usr/local/bin/vpngate-runner"]
+    ports:
+      - "127.0.0.1:18081:18081"
+      - "127.0.0.1:10080:1080"
+    healthcheck:
+      disable: true

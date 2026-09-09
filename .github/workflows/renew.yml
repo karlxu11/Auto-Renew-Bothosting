@@ -1,6 +1,10 @@
 name: Auto Renew Bot-hosting
 
 on:
+  # 每天北京时间 08:02 运行一次（GitHub Cron 使用 UTC）
+  schedule:
+    - cron: "2 0 * * *"
+
   # Cloudflare Workers 通过 repository_dispatch 触发这个事件
   repository_dispatch:
     types: [cf_timer]
@@ -27,15 +31,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install seleniumbase requests
+          pip install seleniumbase 'requests[socks]'
           seleniumbase install chromedriver
 
-      - name: ⚙ 设置代理 (sing-box)
-        continue-on-error: true
+      - name: 📥 准备 VPNGate SOCKS 服务
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          VPNGATE_TO_SOCKS_REF: 337dbaffbfdf69df65f0fc8bdcf6517e45ca18db
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          set -euo pipefail
+          git clone --no-checkout --filter=blob:none https://github.com/shenyanshu/vpngate-to-socks.git vpngate-to-socks
+          git -C vpngate-to-socks fetch --depth 1 origin "$VPNGATE_TO_SOCKS_REF"
+          git -C vpngate-to-socks checkout --detach "$VPNGATE_TO_SOCKS_REF"
+          git -C vpngate-to-socks apply "$GITHUB_WORKSPACE/.github/vpngate-selection.patch"
+
+      - name: 🚇 启动 VPNGate SOCKS5 代理
+        env:
+          VPNGATE_COUNTRY: JP
+          VPNGATE_EXCLUDE_KEYWORD: public
+        run: |
+          set -euo pipefail
+          docker compose -p bothosting-vpngate \
+            -f .github/vpngate-compose.yml \
+            up --build -d
+
+      - name: 🔎 等待 VPNGate 节点连接
+        env:
+          VPNGATE_WAIT_SECONDS: '300'
+        run: |
+          set -euo pipefail
+          python3 scripts/wait_for_vpngate.py
+          echo "IS_PROXY=true" >> "$GITHUB_ENV"
+          echo "PROXY_SERVER=socks5://127.0.0.1:10080" >> "$GITHUB_ENV"
 
       - name: 🚀 运行续期脚本
         id: renew
@@ -49,6 +75,12 @@ jobs:
         run: |
           set -o pipefail
           xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log
+
+      - name: 🧾 输出 VPNGate 服务日志
+        if: always()
+        run: |
+          docker compose -p bothosting-vpngate \
+            -f .github/vpngate-compose.yml logs --tail=160 || true
 
       - name: 🗓️ 设置下次 Cloudflare 续期时间
         if: steps.renew.outputs.expiry_date != ''
@@ -84,11 +116,11 @@ jobs:
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
-          pkill -f sing-box || true
+          docker compose -p bothosting-vpngate \
+            -f .github/vpngate-compose.yml down --remove-orphans || true
           pkill -f chromedriver || true
           pkill -f chrome || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
