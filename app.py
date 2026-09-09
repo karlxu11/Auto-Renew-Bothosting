@@ -353,6 +353,32 @@ def do_discord_login(sb) -> bool:
     return False
 
 
+def open_bot_hosting_for_cookies(sb) -> str:
+    """打开目标站点并确认当前页面允许写入 Bot-hosting Cookie。"""
+    target_url = "https://bot-hosting.net/"
+    allowed_hosts = {"bot-hosting.net", "www.bot-hosting.net"}
+
+    for attempt in range(2):
+        sb.open(target_url)
+        sb.wait_for_ready_state_complete()
+        sb.sleep(2)
+
+        current_url = sb.get_current_url()
+        current_host = (urllib.parse.urlparse(current_url).hostname or "").lower().rstrip(".")
+        print(f"🧭 Cookie 注入前页面: {current_url}")
+
+        if current_host in allowed_hosts:
+            return current_host
+
+        if attempt == 0:
+            print("⚠️ 当前页面不在 Bot-hosting 域名，重新打开目标站点...")
+
+    raise RuntimeError(
+        f"Cookie 注入前页面域名异常，当前 URL: {current_url}；"
+        "可能是代理连接失败、站点跳转或 Cloudflare 验证未完成"
+    )
+
+
 # 主流程
 def main():
     print("#" * 25)
@@ -385,14 +411,14 @@ def main():
         # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
             print("🚀 启动浏览器...")
-            sb.open("https://bot-hosting.net/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
+            open_bot_hosting_for_cookies(sb)
 
             print("📝 注入 Cookie...")
             for name, value in COOKIES.items():
                 if value:
-                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+                    # 不强制指定 domain，让浏览器使用当前已校验的页面域名。
+                    # 这样可避免代理跳转/www 子域导致 InvalidCookieDomainException。
+                    sb.add_cookie({"name": name, "value": value, "path": "/"})
 
             print("🌐 访问 https://bot-hosting.net/a/billings ...")
             sb.open("https://bot-hosting.net/a/billings")
