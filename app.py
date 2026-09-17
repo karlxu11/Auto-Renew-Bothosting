@@ -379,6 +379,179 @@ def open_bot_hosting_for_cookies(sb) -> str:
     )
 
 
+def find_renew_control(sb):
+    """查找续期按钮或倒计时，返回 (按钮选择器, 倒计时)。"""
+    possible_selectors = [
+        'button:contains("Renew")',
+        'button:contains("Renew free plan")',
+        'a:contains("Renew")',
+        '[class*="renew"]',
+        '[class*="Renew"]',
+    ]
+
+    for selector in possible_selectors:
+        try:
+            if not sb.is_element_visible(selector):
+                continue
+
+            button_text = sb.get_text(selector)
+            if "Renew in" in button_text:
+                match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
+                if match:
+                    return None, match.group(1)
+            elif "Renew" in button_text and "in" not in button_text.lower():
+                print(f"✅ 续期按钮可用: '{button_text}'")
+                return selector, None
+        except Exception:
+            # 某个候选选择器失效不应影响后续选择器的检查。
+            continue
+
+    return None, None
+
+
+def open_billings_page(sb) -> bool:
+    """重新打开账单页，用于续期失败后的单次重试。"""
+    try:
+        print("🌐 重新访问 https://bot-hosting.net/a/billings ...")
+        sb.open("https://bot-hosting.net/a/billings")
+        sb.wait_for_ready_state_complete()
+        sb.sleep(3)
+        current_url = sb.get_current_url()
+        current_title = sb.get_title()
+        print(f"📝 重试页面 URL: {current_url}, Title: {current_title}")
+        return "a/billings" in current_url and "/login" not in current_url and "error=" not in current_url
+    except Exception as e:
+        print(f"❌ 重新打开账单页失败: {e}")
+        return False
+
+
+def attempt_renewal(sb, current_expiry: str, attempt_number: int, previous_attempt=False):
+    """执行一次完整续期尝试，返回 success / not_due / failed 结果。"""
+    print(f"🔄 开始第 {attempt_number} 次续期尝试")
+
+    outer_renew_selector, countdown_text = find_renew_control(sb)
+    if countdown_text:
+        extra = f"⏱️ 可续期时间: {format_countdown(countdown_text)}后"
+        if previous_attempt:
+            # 第一次点击后刷新页面已出现倒计时，说明第一次其实已经生效。
+            print(f"✅ 页面已显示续期倒计时，确认续期已生效: {countdown_text}")
+            try:
+                confirmed_expiry = extract_expiry_date(sb.get_page_source())
+            except Exception:
+                confirmed_expiry = None
+            return {
+                "status": "success",
+                "extra": f"续期已生效，{extra}",
+                "expiry": confirmed_expiry,
+            }
+        return {"status": "not_due", "extra": extra, "expiry": current_expiry}
+
+    if not outer_renew_selector:
+        return {"status": "failed", "error": "未找到续期按钮，页面状态未知"}
+
+    print("🔄 点击外部续期按钮，等待验证窗口...")
+    try:
+        sb.sleep(2)
+        sb.click(outer_renew_selector)
+        sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+    except Exception as e:
+        print(f"❌ 点击外部按钮失败: {e}")
+        return {"status": "failed", "error": f"点击外部续期按钮出错: {e}"}
+
+    # 处理弹窗中的 Turnstile
+    print("🔒 检测弹窗中的 Turnstile 验证...")
+    turnstile_passed = False
+    for captcha_attempt in range(1, 4):
+        try:
+            sb.uc_gui_click_captcha()
+            time.sleep(12)
+        except Exception as e:
+            print(f"⚠️ 点击 Turnstile 出错: {e}")
+
+        if wait_for_turnstile_pass(sb, timeout=20):
+            turnstile_passed = True
+            break
+        print(f"⏳ 第 {captcha_attempt} 次未通过，重试点击...")
+
+    if not turnstile_passed:
+        print("❌ Turnstile 验证最终未通过")
+        return {"status": "failed", "error": "Turnstile 验证未通过"}
+
+    # 点击弹窗中的续期按钮
+    print("⏳ 等待续期按钮可用并点击...")
+    time.sleep(5)
+    try:
+        sb.click('button:contains("Renew for 4 days")', timeout=8)
+        print("✅ 已点击续期按钮")
+    except Exception as e:
+        print(f"❌ 续期按钮点击失败: {e}")
+        return {"status": "failed", "error": f"弹窗续期按钮点击失败: {e}"}
+
+    print("⏳ 等待新的过期时间...")
+    sb.sleep(6)
+
+    # 续期成功后通常会出现倒计时；到期日期变化也可作为成功依据。
+    try:
+        new_page_text = sb.get_page_source()
+        new_expiry = extract_expiry_date(new_page_text)
+        new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+    except Exception as e:
+        print(f"❌ 读取续期结果失败: {e}")
+        return {"status": "failed", "error": f"读取续期结果失败: {e}"}
+
+    if new_match:
+        new_countdown = new_match.group(1)
+        print(f"✅ 续期成功！新的倒计时: {new_countdown}")
+        if new_expiry:
+            print(f"📅 新的到期日期: {new_expiry}")
+        return {
+            "status": "success",
+            "extra": f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
+            "expiry": new_expiry,
+            "countdown": new_countdown,
+        }
+
+    if new_expiry and new_expiry != current_expiry:
+        print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+        return {
+            "status": "success",
+            "extra": "到期日期已更新",
+            "expiry": new_expiry,
+        }
+
+    print("⚠️ 续期结果未知，到期日期未变化")
+    return {"status": "failed", "error": "续期结果未知，到期日期未变化"}
+
+
+def renew_with_retry(sb, current_expiry: str):
+    """续期失败时重新加载账单页，并且只额外重跑一次。"""
+    renewal_result = attempt_renewal(sb, current_expiry, attempt_number=1)
+    if renewal_result["status"] != "failed":
+        return renewal_result
+
+    first_error = renewal_result["error"]
+    print(f"⚠️ 第 1 次续期失败: {first_error}")
+    print("🔁 将重新打开账单页并重跑一次续期")
+
+    if not open_billings_page(sb):
+        return {
+            "status": "failed",
+            "error": f"{first_error}；重试前重新打开账单页失败",
+        }
+
+    try:
+        retry_page_source = sb.get_page_source()
+        retry_expiry = extract_expiry_date(retry_page_source) or current_expiry
+        return attempt_renewal(
+            sb,
+            retry_expiry,
+            attempt_number=2,
+            previous_attempt=True,
+        )
+    except Exception as e:
+        return {"status": "failed", "error": f"读取重试页面失败: {e}"}
+
+
 # 主流程
 def main():
     print("#" * 25)
@@ -477,139 +650,40 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
-        # 寻找外部续期按钮
-        outer_renew_selector = None
-        countdown_text = None
-        possible_selectors = [
-            'button:contains("Renew")',
-            'button:contains("Renew free plan")',
-            'a:contains("Renew")',
-            '[class*="renew"]',
-            '[class*="Renew"]',
-        ]
+        # 执行续期；明确失败或结果未知时，重新打开账单页后最多再跑一次。
+        renewal_result = renew_with_retry(sb, current_expiry)
 
-        for selector in possible_selectors:
-            try:
-                if sb.is_element_visible(selector):
-                    button_text = sb.get_text(selector)
-                    if "Renew in" in button_text:
-                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
-                        if match:
-                            countdown_text = match.group(1)
-                        break
-                    elif "Renew" in button_text and "in" not in button_text.lower():
-                        outer_renew_selector = selector
-                        print(f"✅ 续期按钮可用: '{button_text}'")
-                        break
-            except Exception as e:
-                pass
-
-        # 点击外部续期按钮等待弹窗
-        if outer_renew_selector:
-            print("🔄 点击外部续期按钮，等待验证窗口...")
-            try:
-                sb.sleep(2)
-                sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
-            except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
-                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
-                return
-
-            # 处理弹窗中的 Turnstile
-            print("🔒 检测弹窗中的 Turnstile 验证...")
-            turnstile_passed = False
-            for attempt in range(1, 4):
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(12)
-                except Exception as e:
-                    print(f"⚠️ 点击 Turnstile 出错: {e}")
-
-                if wait_for_turnstile_pass(sb, timeout=20):
-                    turnstile_passed = True
-                    break
-                else:
-                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
-
-            if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
-
-            # 点击续期按钮
-            print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
-
-            modal_button_clicked = False
-            try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
-                modal_button_clicked = True
-                print("✅ 已点击续期按钮")
-            except Exception as e:
-                print(f"续期按钮点击失败: {e}")
-
-            print("⏳ 等待新的过期时间...")
-            sb.sleep(6)
-
-            # 提取新的到期日期和倒计时
-            new_page_text = sb.get_page_source()
-            new_expiry = extract_expiry_date(new_page_text)
-            new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
-            if new_match:
-                new_countdown = new_match.group(1)
-                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-                if new_expiry:
-                    print(f"📅 新的到期日期: {new_expiry}")
-                    schedule_expiry = new_expiry
-                send_telegram_message(
-                    format_notification(
-                        "✅ 续期成功",
-                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-                        expiry_date=new_expiry or "（未获取到）"
-                    )
+        if renewal_result["status"] == "success":
+            renewed_expiry = renewal_result.get("expiry")
+            if renewed_expiry:
+                schedule_expiry = renewed_expiry
+            send_telegram_message(
+                format_notification(
+                    "✅ 续期成功",
+                    extra=renewal_result.get("extra", "续期已生效"),
+                    expiry_date=renewed_expiry or "（未获取到）",
                 )
-            else:
-                if new_expiry and new_expiry != current_expiry:
-                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-                    schedule_expiry = new_expiry
-                    send_telegram_message(
-                        format_notification(
-                            "✅ 续期成功",
-                            extra="到期日期已更新",
-                            expiry_date=new_expiry
-                        )
-                    )
-                else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
-                        )
-                    )
-
+            )
+        elif renewal_result["status"] == "not_due":
+            print(f"⏳ 未到续期时间: {renewal_result['extra']}")
+            send_telegram_message(
+                format_notification(
+                    "⏳ 未到续期时间",
+                    extra=renewal_result["extra"],
+                    expiry_date=renewal_result.get("expiry") or current_expiry or "（未获取到）",
+                )
+            )
         else:
-            if countdown_text:
-                friendly = format_countdown(countdown_text)
-                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                send_telegram_message(
-                    format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
+            error_msg = renewal_result.get("error", "未知错误")
+            print(f"❌ 重跑后续期仍失败: {error_msg}")
+            send_telegram_message(
+                format_notification(
+                    "❌ 续期失败",
+                    extra="已自动重跑 1 次，请稍后手动检查",
+                    error=error_msg,
+                    expiry_date=renewal_result.get("expiry") or current_expiry or "（未获取到）",
                 )
-            else:
-                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                send_telegram_message(
-                    format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
+            )
 
         if schedule_expiry:
             set_github_output("expiry_date", schedule_expiry)
