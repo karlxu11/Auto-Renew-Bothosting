@@ -199,6 +199,8 @@ DISCORD_CLIENT_ID   = "884382422530158623"
 OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
 OAUTH_SCOPE         = "identify email guilds"
 DISCORD_API         = "https://discord.com/api/v9/oauth2/authorize"
+OAUTH_LOGIN_REDIRECT = "/a/billings"
+DISCORD_LOGIN_ATTEMPTS = 2
 DISCORD_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
@@ -206,10 +208,13 @@ DISCORD_UA = (
 STATE_RE = re.compile(r"[?&]state=([^&]+)")
 
 
-def capture_discord_state(sb) -> str:
+def capture_discord_state(sb, redirect_path: str = OAUTH_LOGIN_REDIRECT) -> str:
     """打开 /login/discord，从落地页 URL 里提取本次会话的 state"""
     print("🔎 获取 Discord OAuth state...")
-    sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
+    login_url = "https://bot-hosting.net/login/discord?" + urllib.parse.urlencode({
+        "redirect": redirect_path,
+    })
+    sb.uc_open_with_reconnect(login_url, reconnect_time=4)
     time.sleep(2)
 
     url = sb.get_current_url()
@@ -297,33 +302,17 @@ def discord_authorize(state: str) -> str:
     return location
 
 
-def do_discord_login(sb) -> bool:
-    """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
-    print("\n🔑 通过 Discord Token 登录...")
-
-    state = capture_discord_state(sb)
-    if not state:
-        sb.save_screenshot("login_no_state.png")
-        return False
-
-    location = discord_authorize(state)
-    if not location:
-        return False
-
+def open_discord_callback(sb, location: str, attempt_number: int) -> bool:
+    """打开一次性 OAuth 回调，并等待 Bot-hosting 完成登录跳转。"""
     print("↩️ 携带授权码打开回调链接...")
-    sb.uc_open_with_reconnect(location, reconnect_time=4)
-    time.sleep(3)
-
-    url = sb.get_current_url()
-
-    if "/error/banned" in url:
-        print("🚫 账号已被封禁")
-        sb.save_screenshot("login_banned.png")
-        return False
-
-    if "bot-hosting.net" not in url:
-        print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
-        sb.save_screenshot("login_no_redirect.png")
+    try:
+        # 回调中的 code 只能使用一次；这里不使用 uc_open_with_reconnect，避免
+        # 自动重连时重复提交同一个 code，导致服务端返回 disconnect。
+        sb.open(location)
+        sb.wait_for_ready_state_complete()
+    except Exception as e:
+        print(f"❌ 打开 OAuth 回调失败: {e}")
+        sb.save_screenshot(f"login_callback_error_{attempt_number}.png")
         return False
 
     try:
@@ -332,15 +321,33 @@ def do_discord_login(sb) -> bool:
         body_text = ""
     if "fraud" in body_text.lower():
         print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-        sb.save_screenshot("login_fraud.png")
+        sb.save_screenshot(f"login_fraud_{attempt_number}.png")
         return False
 
     for _ in range(30):
         url = sb.get_current_url()
-        path = urllib.parse.urlparse(url).path
-        if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
-            print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
-            return True
+        parsed_url = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed_url.query)
+
+        if query.get("error"):
+            error = query["error"][0]
+            description = query.get("error_description", [""])[0]
+            detail = f"{error}: {description}" if description else error
+            print(f"❌ Bot-hosting OAuth 回调失败: {detail}，当前 URL：{url}")
+            try:
+                body_text = sb.get_text("body")
+                print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
+            except Exception:
+                pass
+            sb.save_screenshot(f"login_oauth_error_{attempt_number}.png")
+            return False
+
+        if parsed_url.hostname in {"bot-hosting.net", "www.bot-hosting.net"}:
+            path = parsed_url.path
+            if path != "/login" and not path.startswith("/login/"):
+                print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
+                return True
+
         time.sleep(0.5)
 
     print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
@@ -349,7 +356,31 @@ def do_discord_login(sb) -> bool:
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
     except Exception:
         pass
-    sb.save_screenshot("login_timeout.png")
+    sb.save_screenshot(f"login_timeout_{attempt_number}.png")
+    return False
+
+
+def do_discord_login(sb) -> bool:
+    """通过 Discord Token 登录，OAuth 回调失败时重新生成 state 并重试一次。"""
+    print("\n🔑 通过 Discord Token 登录...")
+
+    for attempt_number in range(1, DISCORD_LOGIN_ATTEMPTS + 1):
+        if attempt_number > 1:
+            print("🔁 OAuth 回调失败，重新获取 state 和授权码后再试一次...")
+
+        state = capture_discord_state(sb)
+        if not state:
+            sb.save_screenshot(f"login_no_state_{attempt_number}.png")
+            continue
+
+        location = discord_authorize(state)
+        if not location:
+            continue
+
+        if open_discord_callback(sb, location, attempt_number):
+            return True
+
+    print(f"❌ Discord OAuth 登录失败，已尝试 {DISCORD_LOGIN_ATTEMPTS} 次")
     return False
 
 
