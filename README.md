@@ -40,14 +40,6 @@
 | TG_BOT_TOKEN     | ❌ 可选  | Telegram Bot Token，Worker 触发 GitHub Action 后通知 |
 | TG_CHAT_ID       | ❌ 可选  | Telegram Chat ID |
 
-5：在 GitHub 仓库的 `Settings → Secrets and variables → Actions` 添加以下 Secrets，使每次运行后能自动设置下一次 Cloudflare 定时任务：
-
-| Secret 名称 | 说明 |
-|---|---|
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
-| `CLOUDFLARE_WORKER_NAME` | 已部署 Worker 的名称 |
-| `CLOUDFLARE_API_TOKEN` | 创建一个仅限该账户、权限为 `Workers Scripts: Edit` 的 API Token |
-
 ## VPNGate SOCKS5 代理
 
 工作流会在 GitHub Actions 的 Ubuntu runner 中临时启动
@@ -67,9 +59,7 @@
 该方案依赖 GitHub Actions runner 的 Docker、`privileged` 和 `NET_ADMIN` 网络能力。
 SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
-脚本读取到账单页的到期日后，会把该 Worker 的唯一 Cron 设置为**该日期 23:00（北京时间）**。例如到期日是 `2026/08/27`，将设置为 `2026/08/27 23:00`。未读到到期日或 Cloudflare 凭据未配置时，会保留原有定时任务。
-
-6：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。GitHub 定时任务每天 UTC 00:02（北京时间 08:02）自动运行。
+5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。GitHub Actions 会每天 UTC 01:01（北京时间 09:01）自动运行。
 
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
@@ -106,7 +96,7 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 * Discord OAuth 回调失败时会重新生成 state 和授权码自动重试 1 次
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
-* 脚本每次运行成功后，会按页面到期日自动更新 Cloudflare Worker 的 Cron Trigger；GitHub 每日定时仍然保留
+* GitHub Actions 按固定时间每日运行，不再根据续期到期日修改 Cloudflare Worker 的定时任务
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。

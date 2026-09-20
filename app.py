@@ -95,7 +95,7 @@ def send_telegram_message(message: str):
         print(f"❌ Telegram 发送失败: {e}")
 
 # 通知格式
-def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
+def format_notification(status: str, extra: str = "", error: str = "") -> str:
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -115,8 +115,6 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     ]
     if _LOGIN_METHOD != "SESSION_TOKEN":
         lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
-    if expiry_date:
-        lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
         lines.append(extra)
     if error:
@@ -159,40 +157,6 @@ def format_countdown(countdown_str: str) -> str:
             return f"{m}min"
     except:
         return countdown_str
-
-# 将本次账单页读取到的到期日传给 GitHub Actions。GitHub Actions 再使用
-# Cloudflare API 把 Worker 的下一次 Cron 设置为该到期日。
-def set_github_output(name: str, value: str):
-    output_path = os.environ.get("GITHUB_OUTPUT")
-    if not output_path or not value:
-        return
-    try:
-        with open(output_path, "a", encoding="utf-8") as output_file:
-            output_file.write(f"{name}={value}\n")
-    except OSError as e:
-        print(f"⚠️ 无法写入 GitHub Actions 输出 {name}: {e}")
-
-# 获取过期日期
-def extract_expiry_date(page_source: str) -> str:
-    patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
-        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, page_source)
-        if match:
-            date_str = match.group(1)
-            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
-                parts = date_str.split('/')
-                if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
-                    return f"{parts[2]}/{parts[0]}/{parts[1]}"
-            return date_str
-    return None
 
 #   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
 DISCORD_CLIENT_ID   = "884382422530158623"
@@ -456,7 +420,7 @@ def open_billings_page(sb) -> bool:
         return False
 
 
-def attempt_renewal(sb, current_expiry: str, attempt_number: int, previous_attempt=False):
+def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
     """执行一次完整续期尝试，返回 success / not_due / failed 结果。"""
     print(f"🔄 开始第 {attempt_number} 次续期尝试")
 
@@ -466,16 +430,11 @@ def attempt_renewal(sb, current_expiry: str, attempt_number: int, previous_attem
         if previous_attempt:
             # 第一次点击后刷新页面已出现倒计时，说明第一次其实已经生效。
             print(f"✅ 页面已显示续期倒计时，确认续期已生效: {countdown_text}")
-            try:
-                confirmed_expiry = extract_expiry_date(sb.get_page_source())
-            except Exception:
-                confirmed_expiry = None
             return {
                 "status": "success",
                 "extra": f"续期已生效，{extra}",
-                "expiry": confirmed_expiry,
             }
-        return {"status": "not_due", "extra": extra, "expiry": current_expiry}
+        return {"status": "not_due", "extra": extra}
 
     if not outer_renew_selector:
         return {"status": "failed", "error": "未找到续期按钮，页面状态未知"}
@@ -518,13 +477,12 @@ def attempt_renewal(sb, current_expiry: str, attempt_number: int, previous_attem
         print(f"❌ 续期按钮点击失败: {e}")
         return {"status": "failed", "error": f"弹窗续期按钮点击失败: {e}"}
 
-    print("⏳ 等待新的过期时间...")
+    print("⏳ 等待续期结果...")
     sb.sleep(6)
 
-    # 续期成功后通常会出现倒计时；到期日期变化也可作为成功依据。
+    # 续期成功后会出现新的倒计时；不再读取或比较到期日期。
     try:
         new_page_text = sb.get_page_source()
-        new_expiry = extract_expiry_date(new_page_text)
         new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
     except Exception as e:
         print(f"❌ 读取续期结果失败: {e}")
@@ -533,30 +491,19 @@ def attempt_renewal(sb, current_expiry: str, attempt_number: int, previous_attem
     if new_match:
         new_countdown = new_match.group(1)
         print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-        if new_expiry:
-            print(f"📅 新的到期日期: {new_expiry}")
         return {
             "status": "success",
             "extra": f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-            "expiry": new_expiry,
             "countdown": new_countdown,
         }
 
-    if new_expiry and new_expiry != current_expiry:
-        print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-        return {
-            "status": "success",
-            "extra": "到期日期已更新",
-            "expiry": new_expiry,
-        }
-
-    print("⚠️ 续期结果未知，到期日期未变化")
-    return {"status": "failed", "error": "续期结果未知，到期日期未变化"}
+    print("⚠️ 续期结果未知，页面未出现新的倒计时")
+    return {"status": "failed", "error": "续期结果未知，页面未出现新的倒计时"}
 
 
-def renew_with_retry(sb, current_expiry: str):
+def renew_with_retry(sb):
     """续期失败时重新加载账单页，并且只额外重跑一次。"""
-    renewal_result = attempt_renewal(sb, current_expiry, attempt_number=1)
+    renewal_result = attempt_renewal(sb, attempt_number=1)
     if renewal_result["status"] != "failed":
         return renewal_result
 
@@ -570,17 +517,7 @@ def renew_with_retry(sb, current_expiry: str):
             "error": f"{first_error}；重试前重新打开账单页失败",
         }
 
-    try:
-        retry_page_source = sb.get_page_source()
-        retry_expiry = extract_expiry_date(retry_page_source) or current_expiry
-        return attempt_renewal(
-            sb,
-            retry_expiry,
-            attempt_number=2,
-            previous_attempt=True,
-        )
-    except Exception as e:
-        return {"status": "failed", "error": f"读取重试页面失败: {e}"}
+    return attempt_renewal(sb, attempt_number=2, previous_attempt=True)
 
 
 # 主流程
@@ -671,28 +608,14 @@ def main():
         if _LOGIN_METHOD == "Discord Token":
             print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
 
-        # 提取当前到期日期
-        sb.sleep(2)
-        page_source = sb.get_page_source()
-        current_expiry = extract_expiry_date(page_source)
-        schedule_expiry = current_expiry
-        if current_expiry:
-            print(f"📅 当前到期日期: {current_expiry}")
-        else:
-            print("⚠️ 未能提取当前到期日期")
-
         # 执行续期；明确失败或结果未知时，重新打开账单页后最多再跑一次。
-        renewal_result = renew_with_retry(sb, current_expiry)
+        renewal_result = renew_with_retry(sb)
 
         if renewal_result["status"] == "success":
-            renewed_expiry = renewal_result.get("expiry")
-            if renewed_expiry:
-                schedule_expiry = renewed_expiry
             send_telegram_message(
                 format_notification(
                     "✅ 续期成功",
                     extra=renewal_result.get("extra", "续期已生效"),
-                    expiry_date=renewed_expiry or "（未获取到）",
                 )
             )
         elif renewal_result["status"] == "not_due":
@@ -701,7 +624,6 @@ def main():
                 format_notification(
                     "⏳ 未到续期时间",
                     extra=renewal_result["extra"],
-                    expiry_date=renewal_result.get("expiry") or current_expiry or "（未获取到）",
                 )
             )
         else:
@@ -712,15 +634,8 @@ def main():
                     "❌ 续期失败",
                     extra="已自动重跑 1 次，请稍后手动检查",
                     error=error_msg,
-                    expiry_date=renewal_result.get("expiry") or current_expiry or "（未获取到）",
                 )
             )
-
-        if schedule_expiry:
-            set_github_output("expiry_date", schedule_expiry)
-            print(f"🗓️ 已输出下次 Cloudflare 排程依据的到期日: {schedule_expiry}")
-        else:
-            print("⚠️ 未获取到到期日期，保留现有 Cloudflare 定时任务")
 
         # 更新SESSION_TOKEN 
         print("🔄 检查 SESSION_TOKEN 是否需要更新")

@@ -28,7 +28,7 @@ jobs:
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
           pip install seleniumbase 'requests[socks]'
           seleniumbase install chromedriver
 
@@ -62,7 +62,6 @@ jobs:
           echo "PROXY_SERVER=socks5://127.0.0.1:10080" >> "$GITHUB_ENV"
 
       - name: 🚀 运行续期脚本
-        id: renew
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -79,37 +78,6 @@ jobs:
         run: |
           docker compose -p bothosting-vpngate \
             -f .github/vpngate-compose.yml logs --tail=160 || true
-
-      - name: 🗓️ 设置下次 Cloudflare 续期时间
-        if: steps.renew.outputs.expiry_date != ''
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
-          EXPIRY_DATE: ${{ steps.renew.outputs.expiry_date }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_WORKER_NAME" ]; then
-            echo "::warning::未配置 Cloudflare API 凭据，跳过更新定时任务。"
-            exit 0
-          fi
-
-          schedule_date=$(date --date="$EXPIRY_DATE" +%F)
-          # Cloudflare Cron 以 UTC 运行：00:10 UTC 即北京时间 8:10。
-          cron=$(date --date="$schedule_date" '+10 0 %-d %-m *')
-          payload=$(jq -nc --arg cron "$cron" '[{cron: $cron}]')
-
-          echo "将 ${CLOUDFLARE_WORKER_NAME} 的下一次任务设为 ${schedule_date} 8:10（北京时间；Cron: ${cron} UTC）"
-          curl --fail-with-body --silent --show-error \
-            --request PUT \
-            --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${CLOUDFLARE_WORKER_NAME}/schedules" \
-            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            --header "Content-Type: application/json" \
-            --data "$payload" \
-            | jq -e '.success == true' >/dev/null
-
-          echo "✅ Cloudflare 定时任务已更新"
 
       - name: 🧽 清理进程和临时文件
         if: always()
