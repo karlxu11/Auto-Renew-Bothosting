@@ -1,8 +1,7 @@
 name: Auto Renew Bot-hosting
 
 on:
-  schedule:
-    - cron: '1 1 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+  
   # Cloudflare Workers 通过 repository_dispatch 触发这个事件
   repository_dispatch:
     types: [cf_timer]
