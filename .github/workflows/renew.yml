@@ -41,15 +41,41 @@ jobs:
           git -C vpngate-to-socks checkout --detach "$VPNGATE_TO_SOCKS_REF"
           git -C vpngate-to-socks apply "$GITHUB_WORKSPACE/.github/vpngate-selection.patch"
 
-      - name: 🚇 启动 VPNGate SOCKS5 代理
+      - name: 🧱 预拉取 VPNGate 构建镜像
+        run: |
+          set -euo pipefail
+
+          # Docker Hub 的 token 服务偶发连接重置；预拉取失败时使用退避重试。
+          for image in golang:1.26-alpine3.22 alpine:3.22; do
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                break
+              fi
+
+              if [ "$attempt" -eq 5 ]; then
+                echo "无法拉取基础镜像：$image"
+                exit 1
+              fi
+
+              delay=$((attempt * 20))
+              echo "拉取 $image 失败，将在 ${delay}s 后重试（第 ${attempt}/5 次）"
+              sleep "$delay"
+            done
+          done
+
+      - name: 🚇 构建并启动 VPNGate SOCKS5 代理
         env:
           VPNGATE_COUNTRY: JP
           VPNGATE_EXCLUDE_KEYWORD: public
         run: |
           set -euo pipefail
+          # 基础镜像已经在上一步拉取，构建阶段直接使用本地缓存。
           docker compose -p bothosting-vpngate \
             -f .github/vpngate-compose.yml \
-            up --build -d
+            build
+          docker compose -p bothosting-vpngate \
+            -f .github/vpngate-compose.yml \
+            up -d
 
       - name: 🔎 等待 VPNGate 节点连接
         env:
