@@ -83,16 +83,60 @@ def update_github_secret(secret_name, new_value):
         return False
 
 # 发送tg通知
-def send_telegram_message(message: str):
+def send_telegram_message(message: str, screenshot_path: str = ""):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("⚠️ Telegram 未配置，跳过通知")
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        print("✅ Telegram 通知已发送")
+        if screenshot_path and os.path.isfile(screenshot_path):
+            try:
+                url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+                caption = message[:1021] + "..." if len(message) > 1024 else message
+                with open(screenshot_path, "rb") as screenshot:
+                    response = requests.post(
+                        url,
+                        data={"chat_id": TG_CHAT_ID, "caption": caption},
+                        files={
+                            "photo": (
+                                os.path.basename(screenshot_path),
+                                screenshot,
+                                "image/png",
+                            )
+                        },
+                        timeout=30,
+                    )
+
+                if response.ok:
+                    print(f"✅ Telegram 通知和续期截图已发送: {screenshot_path}")
+                    return
+
+                print(f"⚠️ Telegram 截图发送失败（HTTP {response.status_code}），改发文字通知")
+            except Exception as e:
+                print(f"⚠️ Telegram 截图发送异常，改发文字通知: {e}")
+        elif screenshot_path:
+            print(f"⚠️ 续期截图不存在，改发文字通知: {screenshot_path}")
+
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        response = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        response.raise_for_status()
+        print("✅ Telegram 文字通知已发送")
     except Exception as e:
         print(f"❌ Telegram 发送失败: {e}")
+
+
+def save_renewal_screenshot(sb, attempt_number: int) -> str:
+    """保存续期点击后的页面截图，并返回截图路径。"""
+    screenshot_path = f"renew_result_{attempt_number}.png"
+    try:
+        sb.save_screenshot(screenshot_path)
+        if os.path.isfile(screenshot_path):
+            print(f"📸 续期结果截图已保存: {screenshot_path}")
+            return screenshot_path
+        print(f"⚠️ 续期截图未生成: {screenshot_path}")
+    except Exception as e:
+        print(f"⚠️ 保存续期截图失败: {e}")
+    return ""
 
 # 通知格式
 def format_notification(status: str, extra: str = "", error: str = "") -> str:
@@ -477,8 +521,9 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
         print(f"❌ 续期按钮点击失败: {e}")
         return {"status": "failed", "error": f"弹窗续期按钮点击失败: {e}"}
 
-    print("⏳ 等待续期结果...")
-    sb.sleep(6)
+    print("⏳ 等待续期结果 10 秒...")
+    time.sleep(10)
+    renewal_screenshot = save_renewal_screenshot(sb, attempt_number)
 
     # 续期成功后会出现新的倒计时；不再读取或比较到期日期。
     try:
@@ -486,7 +531,11 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
         new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
     except Exception as e:
         print(f"❌ 读取续期结果失败: {e}")
-        return {"status": "failed", "error": f"读取续期结果失败: {e}"}
+        return {
+            "status": "failed",
+            "error": f"读取续期结果失败: {e}",
+            "screenshot": renewal_screenshot,
+        }
 
     if new_match:
         new_countdown = new_match.group(1)
@@ -495,10 +544,15 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
             "status": "success",
             "extra": f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
             "countdown": new_countdown,
+            "screenshot": renewal_screenshot,
         }
 
     print("⚠️ 续期结果未知，页面未出现新的倒计时")
-    return {"status": "failed", "error": "续期结果未知，页面未出现新的倒计时"}
+    return {
+        "status": "failed",
+        "error": "续期结果未知，页面未出现新的倒计时",
+        "screenshot": renewal_screenshot,
+    }
 
 
 def renew_with_retry(sb):
@@ -511,13 +565,18 @@ def renew_with_retry(sb):
     print(f"⚠️ 第 1 次续期失败: {first_error}")
     print("🔁 将重新打开账单页并重跑一次续期")
 
+    first_screenshot = renewal_result.get("screenshot", "")
     if not open_billings_page(sb):
         return {
             "status": "failed",
             "error": f"{first_error}；重试前重新打开账单页失败",
+            "screenshot": first_screenshot,
         }
 
-    return attempt_renewal(sb, attempt_number=2, previous_attempt=True)
+    retry_result = attempt_renewal(sb, attempt_number=2, previous_attempt=True)
+    if not retry_result.get("screenshot") and first_screenshot:
+        retry_result["screenshot"] = first_screenshot
+    return retry_result
 
 
 # 主流程
@@ -616,7 +675,8 @@ def main():
                 format_notification(
                     "✅ 续期成功",
                     extra=renewal_result.get("extra", "续期已生效"),
-                )
+                ),
+                screenshot_path=renewal_result.get("screenshot", ""),
             )
         elif renewal_result["status"] == "not_due":
             print(f"⏳ 未到续期时间: {renewal_result['extra']}")
@@ -624,7 +684,8 @@ def main():
                 format_notification(
                     "⏳ 未到续期时间",
                     extra=renewal_result["extra"],
-                )
+                ),
+                screenshot_path=renewal_result.get("screenshot", ""),
             )
         else:
             error_msg = renewal_result.get("error", "未知错误")
@@ -634,7 +695,8 @@ def main():
                     "❌ 续期失败",
                     extra="已自动重跑 1 次，请稍后手动检查",
                     error=error_msg,
-                )
+                ),
+                screenshot_path=renewal_result.get("screenshot", ""),
             )
 
         # 更新SESSION_TOKEN 
