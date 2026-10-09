@@ -3,8 +3,9 @@
 
 import os, re, sys, time, json, requests, subprocess
 import urllib.request, urllib.parse, urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
+from zoneinfo import ZoneInfo
 
 # 环境变量配置(可以直接私库在双引号里填写)
 EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
@@ -13,6 +14,9 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用�
 GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID") or ""
+CF_API_TOKEN  = os.environ.get("CLOUDFLARE_API_TOKEN") or ""
+CF_WORKER_NAME = os.environ.get("CLOUDFLARE_WORKER_NAME") or ""
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -81,6 +85,60 @@ def update_github_secret(secret_name, new_value):
     except Exception as e:
         print(f"❌ 异常: {e}")
         return False
+
+
+def update_cloudflare_cron_after_renewal():
+    """续期成功后，将 Cloudflare Cron 调整为次日同一北京时间。"""
+    missing = [
+        name for name, value in (
+            ("CLOUDFLARE_ACCOUNT_ID", CF_ACCOUNT_ID),
+            ("CLOUDFLARE_API_TOKEN", CF_API_TOKEN),
+            ("CLOUDFLARE_WORKER_NAME", CF_WORKER_NAME),
+        ) if not value
+    ]
+    if missing:
+        print(f"⚠️ 未配置 {', '.join(missing)}，跳过 Cloudflare 定时任务更新")
+        return ""
+
+    # Cloudflare Cron 使用 UTC 且精确到分钟；按通知所用的北京时间取时后换算。
+    now_local = datetime.now(ZoneInfo("Asia/Shanghai"))
+    next_run_local = now_local.replace(second=0, microsecond=0) + timedelta(days=1)
+    next_run_utc = next_run_local.astimezone(timezone.utc)
+    cron_expression = f"{next_run_utc.minute} {next_run_utc.hour} * * *"
+    worker_name = urllib.parse.quote(CF_WORKER_NAME, safe="")
+    url = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{CF_ACCOUNT_ID}/workers/scripts/{worker_name}/schedules"
+    )
+
+    try:
+        response = requests.put(
+            url,
+            headers={
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=[{"cron": cron_expression}],
+            timeout=30,
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        if not response.ok or not payload.get("success"):
+            errors = payload.get("errors") or response.text[:500]
+            raise RuntimeError(f"HTTP {response.status_code}: {errors}")
+
+        scheduled_time = next_run_local.strftime("%Y-%m-%d %H:%M")
+        print(
+            f"✅ Cloudflare Cron 已更新: {cron_expression} (UTC)，"
+            f"次日北京时间 {scheduled_time} 执行"
+        )
+        return scheduled_time
+    except Exception as e:
+        print(f"❌ Cloudflare 定时任务更新失败: {e}")
+        return ""
 
 # 发送tg通知
 def send_telegram_message(message: str, screenshot_path: str = ""):
@@ -671,10 +729,16 @@ def main():
         renewal_result = renew_with_retry(sb)
 
         if renewal_result["status"] == "success":
+            scheduled_time = update_cloudflare_cron_after_renewal()
+            success_extra = renewal_result.get("extra", "续期已生效")
+            if scheduled_time:
+                success_extra += f"\n🕒 Cloudflare 下次计划: {scheduled_time}（北京时间）"
+            else:
+                success_extra += "\n⚠️ Cloudflare 定时任务未更新，请检查 Actions 日志和相关 Secrets"
             send_telegram_message(
                 format_notification(
                     "✅ 续期成功",
-                    extra=renewal_result.get("extra", "续期已生效"),
+                    extra=success_extra,
                 ),
                 screenshot_path=renewal_result.get("screenshot", ""),
             )

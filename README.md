@@ -2,7 +2,7 @@
 
 这是一个基于 GitHub Actions 的自动化脚本，用于登录并自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
 
-工作流支持 GitHub 每日定时触发、Cloudflare Worker 触发和手动触发。
+工作流支持 Cloudflare Worker 定时触发、Worker URL 手动触发和 GitHub Actions 页面手动运行。
 
 ⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
 
@@ -18,6 +18,11 @@
 | GH_TOKEN           | ❌ 可选  | GitHub(classic) token,用于自动更新session_token,以ghp_xxx开头|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
+| CLOUDFLARE_ACCOUNT_ID | ❌ 可选 | Cloudflare Account ID；用于续期成功后调整 Worker Cron      |
+| CLOUDFLARE_API_TOKEN  | ❌ 可选 | Cloudflare API Token；需要目标账户的 `Workers Scripts Write` 权限 |
+| CLOUDFLARE_WORKER_NAME | ❌ 可选 | Cloudflare Workers & Pages 中部署的 Worker 名称            |
+
+配置这三个 Cloudflare Secrets 后，续期成功会把 Worker Cron 更新到次日相同的北京时间。Cloudflare Cron 按 UTC、分钟粒度运行；未配置这些 Secrets 时，续期仍会正常完成，但不会调整定时任务。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -26,7 +31,7 @@
 
 2：在`setting`➡`secrets and variables`➡`Actions` 里添加上方必填的secrets
 
-3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署。
+3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署，并为它添加一个初始 Cron Trigger。此 Worker 使用一个 Cron Trigger，续期成功后会用新时间替换该计划。
 
 4：在 Cloudflare Worker 的 Variables / Secrets 里添加以下变量
 
@@ -59,7 +64,7 @@
 该方案依赖 GitHub Actions runner 的 Docker、`privileged` 和 `NET_ADMIN` 网络能力。
 SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
-5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。GitHub Actions 会每天 UTC 01:01（北京时间 09:01）自动运行。
+5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。Cloudflare Cron 首次按上一步设置的计划运行；每次续期成功后，脚本会把它调整为次日相同的北京时间，之后每天在该时刻运行。
 
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
@@ -96,7 +101,7 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 * Discord OAuth 回调失败时会重新生成 state 和授权码自动重试 1 次
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
-* GitHub Actions 按固定时间每日运行，不再根据续期到期日修改 Cloudflare Worker 的定时任务
+* Cloudflare Worker 的定时任务只会在续期成功后调整；续期失败或未到续期时间时会保留现有计划
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。
