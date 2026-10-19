@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, requests, subprocess
+import os, re, sys, time, json, requests, subprocess, html
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
@@ -492,18 +492,39 @@ def find_renew_control(sb):
                 continue
 
             button_text = sb.get_text(selector)
-            if "Renew in" in button_text:
-                match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
-                if match:
-                    return None, match.group(1)
-            elif "Renew" in button_text and "in" not in button_text.lower():
+            countdown = extract_renewal_countdown(button_text)
+            if countdown:
+                return None, countdown
+
+            button_text_lower = button_text.lower()
+            if "renew" in button_text_lower and "cooldown" not in button_text_lower:
                 print(f"✅ 续期按钮可用: '{button_text}'")
                 return selector, None
         except Exception:
             # 某个候选选择器失效不应影响后续选择器的检查。
             continue
 
+    # Bot-hosting 当前账单页显示的是 “Renewal cooldown HH:MM:SS”，
+    # 其结构不一定会被上面的按钮选择器匹配到，因此再从整页文本识别一次。
+    try:
+        countdown = extract_renewal_countdown(sb.get_page_source())
+        if countdown:
+            return None, countdown
+    except Exception:
+        pass
+
     return None, None
+
+
+def extract_renewal_countdown(page_text: str):
+    """从可见文本或 HTML 中识别 Bot-hosting 的续期冷却倒计时。"""
+    plain_text = html.unescape(re.sub(r"<[^>]*>", " ", page_text or ""))
+    match = re.search(
+        r"\b(?:renew\s+in|renewal\s+cooldown)\s*:?[ \t]*(\d{1,2}:\d{2}:\d{2})\b",
+        plain_text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
 
 
 def open_billings_page(sb) -> bool:
@@ -586,7 +607,7 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
     # 续期成功后会出现新的倒计时；不再读取或比较到期日期。
     try:
         new_page_text = sb.get_page_source()
-        new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+        new_countdown = extract_renewal_countdown(new_page_text)
     except Exception as e:
         print(f"❌ 读取续期结果失败: {e}")
         return {
@@ -595,8 +616,7 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
             "screenshot": renewal_screenshot,
         }
 
-    if new_match:
-        new_countdown = new_match.group(1)
+    if new_countdown:
         print(f"✅ 续期成功！新的倒计时: {new_countdown}")
         return {
             "status": "success",
