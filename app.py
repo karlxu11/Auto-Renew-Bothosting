@@ -88,7 +88,7 @@ def update_github_secret(secret_name, new_value):
 
 
 def update_cloudflare_cron_after_renewal():
-    """续期成功后，将 Cloudflare Cron 调整为次日同一北京时间。"""
+    """续期成功后，将 Cloudflare Cron 调整为当前时间约 5 分钟后。"""
     missing = [
         name for name, value in (
             ("CLOUDFLARE_ACCOUNT_ID", CF_ACCOUNT_ID),
@@ -100,9 +100,11 @@ def update_cloudflare_cron_after_renewal():
         print(f"⚠️ 未配置 {', '.join(missing)}，跳过 Cloudflare 定时任务更新")
         return ""
 
-    # Cloudflare Cron 使用 UTC 且精确到分钟；按通知所用的北京时间取时后换算。
-    now_local = datetime.now(ZoneInfo("Asia/Shanghai"))
-    next_run_local = now_local.replace(second=0, microsecond=0) + timedelta(days=1)
+    # Cloudflare Cron 使用 UTC 且精确到分钟；向上取整，避免早于 5 分钟触发。
+    target_local = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=5)
+    next_run_local = target_local.replace(second=0, microsecond=0)
+    if target_local.second or target_local.microsecond:
+        next_run_local += timedelta(minutes=1)
     next_run_utc = next_run_local.astimezone(timezone.utc)
     cron_expression = f"{next_run_utc.minute} {next_run_utc.hour} * * *"
     worker_name = urllib.parse.quote(CF_WORKER_NAME, safe="")
@@ -133,7 +135,7 @@ def update_cloudflare_cron_after_renewal():
         scheduled_time = next_run_local.strftime("%Y-%m-%d %H:%M")
         print(
             f"✅ Cloudflare Cron 已更新: {cron_expression} (UTC)，"
-            f"次日北京时间 {scheduled_time} 执行"
+            f"北京时间 {scheduled_time} 执行"
         )
         return scheduled_time
     except Exception as e:

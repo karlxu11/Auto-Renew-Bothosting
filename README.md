@@ -22,7 +22,7 @@
 | CLOUDFLARE_API_TOKEN  | ❌ 可选 | Cloudflare API Token；需要目标账户的 `Workers Scripts Write` 权限 |
 | CLOUDFLARE_WORKER_NAME | ❌ 可选 | Cloudflare Workers & Pages 中部署的 Worker 名称            |
 
-配置这三个 Cloudflare Secrets 后，续期成功会把 Worker Cron 更新到次日相同的北京时间。Cloudflare Cron 按 UTC、分钟粒度运行；未配置这些 Secrets 时，续期仍会正常完成，但不会调整定时任务。
+配置这三个 Cloudflare Secrets 后，续期成功会把 Worker Cron 更新到当前时刻约 5 分钟后（向上取整到分钟，因此约 5–6 分钟后触发）。Cloudflare Cron 按 UTC、分钟粒度运行；该计划之后每天在同一时刻重复。未配置这些 Secrets 时，续期仍会正常完成，但不会调整定时任务。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -64,7 +64,7 @@
 该方案依赖 GitHub Actions runner 的 Docker、`privileged` 和 `NET_ADMIN` 网络能力。
 SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
-5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。Cloudflare Cron 首次按上一步设置的计划运行；每次续期成功后，脚本会把它调整为次日相同的北京时间，之后每天在该时刻运行。
+5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。Cloudflare Cron 首次按上一步设置的计划运行；每次续期成功后，脚本会把它调整为约 5 分钟后的北京时间，并继续每天在该时刻运行。
 
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
