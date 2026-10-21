@@ -118,7 +118,7 @@ async function saveAccountSchedule(request, env) {
 
   const schedulerKey = env.SCHEDULER_AUTH_KEY;
   if (!schedulerKey || request.headers.get("Authorization") !== `Bearer ${schedulerKey}`) {
-    return new Response("Unauthorized", { status: 401 });
+    return new Response("Unauthorized: SCHEDULER_AUTH_KEY is missing or does not match", { status: 401 });
   }
   if (!env.RENEWAL_STATE) {
     return new Response("Missing RENEWAL_STATE KV binding", { status: 500 });

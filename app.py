@@ -138,10 +138,17 @@ def report_account_schedule(account, result):
             json=payload,
             timeout=20,
         )
-        response.raise_for_status()
+        if not response.ok:
+            detail = re.sub(r"\s+", " ", response.text or "").strip()[:240]
+            raise requests.HTTPError(
+                f"HTTP {response.status_code}" + (f": {detail}" if detail else ""),
+                response=response,
+            )
         print(f"🗓️ 已登记账号 {account['name']} 的下次检查时间: {payload['next_run_at']}")
     except Exception as e:
         print(f"❌ 回写账号 {account['name']} 的调度时间失败: {e}")
+        if getattr(e, "response", None) is not None and e.response.status_code == 401:
+            print("🔧 请确认 Cloudflare Worker 与 GitHub Actions 中的 SCHEDULER_AUTH_KEY 完全相同，且 Worker Secret 已部署。")
 
 # 发送tg通知
 def send_telegram_message(message: str, screenshot_path: str = ""):
@@ -234,7 +241,7 @@ def wait_for_turnstile_pass(sb, timeout=30):
     while time.time() - start < timeout:
         page_lower = sb.get_page_source().lower()
         if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
+            print("ℹ️ 页面上已没有检测到 Cloudflare 验证提示")
             # sb.save_screenshot("turnstile_passed.png")
             return True
         sb.sleep(1)
@@ -326,9 +333,26 @@ def do_email_password_login(sb) -> bool:
             ):
                 print("✅ 邮箱和密码登录成功")
                 return True
+            # 有些前端会先更新会话状态，再由后续导航改变 URL。
+            # 账单页访问会再次确认会话是否有效。
+            if not sb.is_element_visible(password_selector):
+                print("ℹ️ 登录表单已关闭，将通过打开账单页确认登录状态")
+                return True
             time.sleep(0.5)
 
-        print("❌ 邮箱登录后未跳转到 Bot-hosting 控制面板")
+        current_url = sb.get_current_url()
+        parsed_url = urllib.parse.urlparse(current_url)
+        print(
+            "❌ 邮箱登录未完成："
+            f"页面路径仍为 {parsed_url.path or '/'}，"
+            f"密码框仍显示={sb.is_element_visible(password_selector)}"
+        )
+        feedback = get_login_feedback(sb)
+        if feedback:
+            for message in feedback:
+                print(f"🔎 登录页面提示: {message}")
+        else:
+            print("🔎 页面没有提供可识别的登录错误提示；请检查账号密码或登录页截图")
         sb.save_screenshot("login_email_timeout.png")
         return False
     except Exception as e:
@@ -338,6 +362,37 @@ def do_email_password_login(sb) -> bool:
         except Exception:
             pass
         return False
+
+
+def get_login_feedback(sb):
+    """读取页面上的可见错误提示，不读取或记录输入框内容。"""
+    try:
+        messages = sb.execute_script(
+            """
+            const selectors = [
+              '[role="alert"]', '[aria-live="assertive"]',
+              '[data-sonner-toast]', '[class*="error" i]'
+            ];
+            const nodes = [...new Set(selectors.flatMap(s => [...document.querySelectorAll(s)]))];
+            return nodes
+              .filter(el => {
+                const style = getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length;
+              })
+              .map(el => (el.innerText || '').trim())
+              .filter(Boolean)
+              .slice(0, 6);
+            """
+        ) or []
+        safe_messages = []
+        for message in messages:
+            sanitized = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email]", str(message))
+            sanitized = re.sub(r"\s+", " ", sanitized).strip()[:240]
+            if sanitized and sanitized not in safe_messages:
+                safe_messages.append(sanitized)
+        return safe_messages
+    except Exception:
+        return []
 
 
 def find_renew_control(sb):
