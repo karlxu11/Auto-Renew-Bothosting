@@ -193,6 +193,48 @@ def send_telegram_message(message: str, screenshot_path: str = ""):
         print(f"❌ Telegram 发送失败: {e}")
 
 
+def send_login_step_screenshot(sb, account, step: str):
+    """截图并通过现有 Telegram 配置发送登录步骤；截图时遮住输入框内容。"""
+    account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
+    step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
+    screenshot_path = f"login_{account_id}_{step_id}.png"
+    try:
+        sb.execute_script(
+            """
+            for (const el of document.querySelectorAll(
+              'input[type="email"], input[name="email"], input[autocomplete="email"], input[type="password"], input[type="text"]'
+            )) {
+              el.setAttribute('data-login-screenshot-style', el.getAttribute('style') || '');
+              el.style.setProperty('color', 'transparent', 'important');
+              el.style.setProperty('-webkit-text-fill-color', 'transparent', 'important');
+              el.style.setProperty('text-shadow', 'none', 'important');
+              el.style.setProperty('caret-color', 'transparent', 'important');
+            }
+            """
+        )
+        sb.save_screenshot(screenshot_path)
+    except Exception as e:
+        print(f"⚠️ 登录步骤截图失败（{step}）: {e}")
+        return
+    finally:
+        try:
+            sb.execute_script(
+                """
+                for (const el of document.querySelectorAll('[data-login-screenshot-style]')) {
+                  const oldStyle = el.getAttribute('data-login-screenshot-style');
+                  if (oldStyle) el.setAttribute('style', oldStyle);
+                  else el.removeAttribute('style');
+                  el.removeAttribute('data-login-screenshot-style');
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    caption = f"🔐 Bot-hosting 登录 | {account.get('name', '账号')} | {step}"
+    send_telegram_message(caption, screenshot_path=screenshot_path)
+
+
 def save_renewal_screenshot(sb, attempt_number: int) -> str:
     """保存续期点击后的页面截图，并返回截图路径。"""
     screenshot_path = f"renew_result_{attempt_number}.png"
@@ -270,7 +312,7 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
-def do_email_password_login(sb) -> bool:
+def do_email_password_login(sb, account) -> bool:
     """通过 Bot-hosting 邮箱和密码登录；如需人工验证则等待验证通过。"""
     if not EMAIL or not BOT_HOSTING_PASSWORD:
         print("⚠️ 未配置 EMAIL 或 BOT_HOSTING_PASSWORD，跳过邮箱登录")
@@ -281,6 +323,7 @@ def do_email_password_login(sb) -> bool:
         sb.uc_open_with_reconnect("https://bot-hosting.net/login", reconnect_time=4)
         sb.wait_for_ready_state_complete()
         sb.sleep(2)
+        send_login_step_screenshot(sb, account, "01_login_page")
 
         email_selectors = [
             'input[type="email"]',
@@ -309,23 +352,29 @@ def do_email_password_login(sb) -> bool:
                 sb.wait_for_element_visible(email_selectors[0], timeout=15)
                 email_selector = email_selectors[0]
             sb.update_text(email_selector, EMAIL)
+            send_login_step_screenshot(sb, account, "02_email_entered")
             sb.click(continue_selector, timeout=10)
+            send_login_step_screenshot(sb, account, "03_continue_with_email")
             sb.wait_for_element_visible(password_selector, timeout=15)
+            send_login_step_screenshot(sb, account, "04_password_page")
 
         email_selector = visible_email_selector()
         if email_selector and sb.is_element_visible(email_selector):
             sb.update_text(email_selector, EMAIL)
         sb.update_text(password_selector, BOT_HOSTING_PASSWORD)
+        send_login_step_screenshot(sb, account, "05_credentials_entered")
 
         print("⏳ 邮箱和密码已填写，等待 10 秒后继续登录...")
         sb.sleep(10)
+        send_login_step_screenshot(sb, account, "06_wait_10_seconds")
 
         # 不尝试绕过 Turnstile；常规通过时继续，遇到挑战则超时并报告登录失败。
         if not wait_for_turnstile_pass(sb, timeout=30):
-            sb.save_screenshot("login_turnstile_timeout.png")
+            send_login_step_screenshot(sb, account, "07_verification_wait_timeout")
             return False
 
         sb.click(sign_in_selector, timeout=10)
+        send_login_step_screenshot(sb, account, "08_sign_in_clicked")
         for _ in range(60):
             current_url = sb.get_current_url()
             parsed_url = urllib.parse.urlparse(current_url)
@@ -335,11 +384,13 @@ def do_email_password_login(sb) -> bool:
                 and not parsed_url.path.startswith("/login/")
             ):
                 print("✅ 邮箱和密码登录成功")
+                send_login_step_screenshot(sb, account, "09_login_success")
                 return True
             # 有些前端会先更新会话状态，再由后续导航改变 URL。
             # 账单页访问会再次确认会话是否有效。
             if not sb.is_element_visible(password_selector):
                 print("ℹ️ 登录表单已关闭，将通过打开账单页确认登录状态")
+                send_login_step_screenshot(sb, account, "09_login_form_closed")
                 return True
             time.sleep(0.5)
 
@@ -356,12 +407,12 @@ def do_email_password_login(sb) -> bool:
                 print(f"🔎 登录页面提示: {message}")
         else:
             print("🔎 页面没有提供可识别的登录错误提示；请检查账号密码或登录页截图")
-        sb.save_screenshot("login_email_timeout.png")
+        send_login_step_screenshot(sb, account, "09_login_failed")
         return False
     except Exception as e:
         print(f"❌ 邮箱和密码登录失败: {e}")
         try:
-            sb.save_screenshot("login_email_error.png")
+            send_login_step_screenshot(sb, account, "error")
         except Exception:
             pass
         return False
@@ -599,7 +650,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
 
         login_ok = False
 
-        if EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb):
+        if EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb, account):
             if open_billings_page(sb):
                 login_ok = True
                 print("✅ 邮箱和密码登录成功，当前已到达账单页")
