@@ -5,7 +5,6 @@ import os, re, sys, time, json, requests, html
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
-from zoneinfo import ZoneInfo
 
 # 通过 GitHub Actions Secrets 等环境变量配置账号信息，不要写入源码。
 EMAIL         = os.environ.get("EMAIL") or ""           # Bot-hosting 登录邮箱，也用于通知
@@ -13,9 +12,9 @@ BOT_HOSTING_PASSWORD = os.environ.get("BOT_HOSTING_PASSWORD") or ""  # Bot-hosti
 BOT_HOSTING_ACCOUNTS = os.environ.get("BOT_HOSTING_ACCOUNTS") or ""  # 多账号 JSON 配置
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
-CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID") or ""
-CF_API_TOKEN  = os.environ.get("CLOUDFLARE_API_TOKEN") or ""
-CF_WORKER_NAME = os.environ.get("CLOUDFLARE_WORKER_NAME") or ""
+SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "").strip().rstrip("/")
+SCHEDULER_AUTH_KEY = os.environ.get("SCHEDULER_AUTH_KEY") or ""
+SELECTED_ACCOUNT_IDS = os.environ.get("SELECTED_ACCOUNT_IDS", "").strip()
 
 if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
     print("ℹ️ 请配置 BOT_HOSTING_ACCOUNTS，或配置 EMAIL 与 BOT_HOSTING_PASSWORD。脚本终止。")
@@ -42,85 +41,107 @@ def load_accounts():
             if not isinstance(raw_account, dict):
                 raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项必须是对象")
 
+            account_id = str(raw_account.get("id") or f"account_{index}").strip()
             email = str(raw_account.get("email") or "").strip()
             password = str(raw_account.get("password") or "")
             name = str(raw_account.get("name") or f"账号 {index}").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account_id):
+                raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项的 id 格式无效")
             if not email:
                 raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项缺少 email")
             if not password:
                 raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项缺少 password")
 
             accounts.append({
+                "id": account_id,
                 "name": name or f"账号 {index}",
                 "email": email,
                 "password": password,
             })
+        ids = [account["id"] for account in accounts]
+        if len(ids) != len(set(ids)):
+            raise ValueError("BOT_HOSTING_ACCOUNTS 中的 id 必须唯一")
         return accounts
 
     if not EMAIL or not BOT_HOSTING_PASSWORD:
         raise ValueError("单账号登录需要同时配置 EMAIL 和 BOT_HOSTING_PASSWORD")
 
     return [{
+        "id": "account_1",
         "name": "账号 1",
         "email": EMAIL,
         "password": BOT_HOSTING_PASSWORD,
     }]
 
 
-def update_cloudflare_cron_after_renewal():
-    """续期成功后，将 Cloudflare Cron 调整为当前时间约 5 分钟后。"""
-    missing = [
-        name for name, value in (
-            ("CLOUDFLARE_ACCOUNT_ID", CF_ACCOUNT_ID),
-            ("CLOUDFLARE_API_TOKEN", CF_API_TOKEN),
-            ("CLOUDFLARE_WORKER_NAME", CF_WORKER_NAME),
-        ) if not value
-    ]
-    if missing:
-        print(f"⚠️ 未配置 {', '.join(missing)}，跳过 Cloudflare 定时任务更新")
-        return ""
-
-    # Cloudflare Cron 使用 UTC 且精确到分钟；向上取整，避免早于 5 分钟触发。
-    target_local = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=5)
-    next_run_local = target_local.replace(second=0, microsecond=0)
-    if target_local.second or target_local.microsecond:
-        next_run_local += timedelta(minutes=1)
-    next_run_utc = next_run_local.astimezone(timezone.utc)
-    cron_expression = f"{next_run_utc.minute} {next_run_utc.hour} * * *"
-    worker_name = urllib.parse.quote(CF_WORKER_NAME, safe="")
-    url = (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        f"{CF_ACCOUNT_ID}/workers/scripts/{worker_name}/schedules"
-    )
+def select_accounts(accounts):
+    """按 Worker 事件中的账号 ID 筛选；人工运行未指定时处理全部账号。"""
+    raw_ids = SELECTED_ACCOUNT_IDS
+    if not raw_ids or raw_ids == "null":
+        return accounts
 
     try:
-        response = requests.put(
-            url,
+        selected_ids = json.loads(raw_ids)
+    except json.JSONDecodeError as e:
+        raise ValueError("SELECTED_ACCOUNT_IDS 必须是 JSON 数组") from e
+    if selected_ids is None:
+        return accounts
+    if not isinstance(selected_ids, list) or any(not isinstance(item, str) for item in selected_ids):
+        raise ValueError("SELECTED_ACCOUNT_IDS 必须是字符串数组")
+    if not selected_ids:
+        return []
+
+    account_by_id = {account["id"]: account for account in accounts}
+    unknown_ids = sorted(set(selected_ids) - account_by_id.keys())
+    if unknown_ids:
+        raise ValueError(f"触发事件包含未知账号 ID: {', '.join(unknown_ids)}")
+    return [account_by_id[account_id] for account_id in dict.fromkeys(selected_ids)]
+
+
+def countdown_to_seconds(countdown: str):
+    match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})", str(countdown or "").strip())
+    if not match:
+        return None
+    hours, minutes, seconds = map(int, match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def report_account_schedule(account, result):
+    """将单个账号的下次检查时间回写给 Cloudflare Worker。"""
+    status = (result or {}).get("status", "failed")
+    countdown = (result or {}).get("countdown")
+    seconds = countdown_to_seconds(countdown) if countdown else None
+
+    now = datetime.now(timezone.utc)
+    if status in {"success", "not_due"} and seconds is not None:
+        # 留两分钟余量，避免倒计时边界和页面更新延迟导致过早触发。
+        next_run = now + timedelta(seconds=max(60, seconds) + 120)
+    elif status == "success":
+        # 如果续期成功但页面没给出倒计时，明天重新检查并恢复准确时间。
+        next_run = now + timedelta(hours=24)
+    else:
+        # 登录、代理或续期异常时延后重试，避免每小时重复启动同一账号。
+        next_run = now + timedelta(hours=6)
+
+    payload = {
+        "account_id": account["id"],
+        "status": status,
+        "next_run_at": next_run.isoformat().replace("+00:00", "Z"),
+    }
+    try:
+        response = requests.post(
+            f"{SCHEDULER_URL}/api/schedule",
             headers={
-                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Authorization": f"Bearer {SCHEDULER_AUTH_KEY}",
                 "Content-Type": "application/json",
             },
-            json=[{"cron": cron_expression}],
-            timeout=30,
+            json=payload,
+            timeout=20,
         )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-
-        if not response.ok or not payload.get("success"):
-            errors = payload.get("errors") or response.text[:500]
-            raise RuntimeError(f"HTTP {response.status_code}: {errors}")
-
-        scheduled_time = next_run_local.strftime("%Y-%m-%d %H:%M")
-        print(
-            f"✅ Cloudflare Cron 已更新: {cron_expression} (UTC)，"
-            f"北京时间 {scheduled_time} 执行"
-        )
-        return scheduled_time
+        response.raise_for_status()
+        print(f"🗓️ 已登记账号 {account['name']} 的下次检查时间: {payload['next_run_at']}")
     except Exception as e:
-        print(f"❌ Cloudflare 定时任务更新失败: {e}")
-        return ""
+        print(f"❌ 回写账号 {account['name']} 的调度时间失败: {e}")
 
 # 发送tg通知
 def send_telegram_message(message: str, screenshot_path: str = ""):
@@ -399,8 +420,9 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
             return {
                 "status": "success",
                 "extra": f"续期已生效，{extra}",
+                "countdown": countdown_text,
             }
-        return {"status": "not_due", "extra": extra}
+        return {"status": "not_due", "extra": extra, "countdown": countdown_text}
 
     if not outer_renew_selector:
         return {"status": "failed", "error": "未找到续期按钮，页面状态未知"}
@@ -528,7 +550,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
 
         if not login_ok:
             send_telegram_message(format_notification("❌ 登录失败", error="邮箱密码登录失败"))
-            return
+            return {"status": "failed", "error": "邮箱密码登录失败"}
 
         print("ℹ️ 本次使用邮箱和密码登录")
 
@@ -536,12 +558,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
         renewal_result = renew_with_retry(sb)
 
         if renewal_result["status"] == "success":
-            scheduled_time = update_cloudflare_cron_after_renewal()
             success_extra = renewal_result.get("extra", "续期已生效")
-            if scheduled_time:
-                success_extra += f"\n🕒 Cloudflare 下次计划: {scheduled_time}（北京时间）"
-            else:
-                success_extra += "\n⚠️ Cloudflare 定时任务未更新，请检查 Actions 日志和相关 Secrets"
             send_telegram_message(
                 format_notification("✅ 续期成功", extra=success_extra),
                 screenshot_path=renewal_result.get("screenshot", ""),
@@ -565,6 +582,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
             )
 
     print(f"✅ 账号 {account['name']} 的续期流程完成")
+    return renewal_result
 
 
 # 主流程
@@ -581,6 +599,20 @@ def main():
         print(f"❌ 账号配置错误: {e}")
         sys.exit(1)
 
+    if not SCHEDULER_URL or not SCHEDULER_AUTH_KEY:
+        print("❌ 自动调度需要配置 SCHEDULER_URL 和 SCHEDULER_AUTH_KEY。脚本终止。")
+        sys.exit(1)
+
+    try:
+        accounts = select_accounts(accounts)
+    except ValueError as e:
+        print(f"❌ 账号筛选错误: {e}")
+        sys.exit(1)
+
+    if not accounts:
+        print("ℹ️ 本次没有选中的账号，无需处理。")
+        return
+
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
@@ -595,8 +627,9 @@ def main():
     failed_accounts = 0
     for index, account in enumerate(accounts, start=1):
         print(f"\n========== 开始续期账号 {index}/{len(accounts)} ==========")
+        result = {"status": "failed"}
         try:
-            renew_account(account, sb_kwargs, proxy_server, is_proxy)
+            result = renew_account(account, sb_kwargs, proxy_server, is_proxy) or result
         except Exception as e:
             failed_accounts += 1
             EMAIL = account["email"]
@@ -605,6 +638,7 @@ def main():
             _LOGIN_METHOD = "Email + Password"
             print(f"❌ 账号 {index} 执行异常: {e}")
             send_telegram_message(format_notification("❌ 账号续期异常", error=str(e)))
+        report_account_schedule(account, result)
 
     print(f"🏁 多账号续期处理完成：共处理 {len(accounts)} 个账号，未捕获异常 {failed_accounts} 个")
 

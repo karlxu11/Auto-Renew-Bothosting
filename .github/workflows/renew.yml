@@ -91,11 +91,11 @@ jobs:
           EMAIL: ${{ secrets.EMAIL }}
           BOT_HOSTING_PASSWORD: ${{ secrets.BOT_HOSTING_PASSWORD }}
           BOT_HOSTING_ACCOUNTS: ${{ secrets.BOT_HOSTING_ACCOUNTS }}
+          SELECTED_ACCOUNT_IDS: ${{ github.event_name == 'repository_dispatch' && toJSON(github.event.client_payload.account_ids) || '' }}
+          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          SCHEDULER_AUTH_KEY: ${{ secrets.SCHEDULER_AUTH_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
         run: |
           set -o pipefail
           xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log

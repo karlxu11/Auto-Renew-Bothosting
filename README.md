@@ -14,14 +14,11 @@
 |---------------------|----------|---------------------------------------------------|
 | EMAIL              | 单账号必填 | Bot-hosting 登录邮箱，也用于续期通知                  |
 | BOT_HOSTING_PASSWORD | 单账号必填 | Bot-hosting 登录密码                                 |
-| BOT_HOSTING_ACCOUNTS | ❌ 可选 | 多账号 JSON 配置；设置后优先于单账号配置               |
+| BOT_HOSTING_ACCOUNTS | 多账号必填 | 多账号 JSON 配置；设置后优先于单账号配置               |
+| SCHEDULER_URL | ✅ 必填 | Cloudflare Worker 的完整 URL，例如 `https://renew.example.workers.dev` |
+| SCHEDULER_AUTH_KEY | ✅ 必填 | 回写账号调度状态的密钥，需与 Worker 中的同名 Secret 一致 |
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
-| CLOUDFLARE_ACCOUNT_ID | ❌ 可选 | Cloudflare Account ID；用于续期成功后调整 Worker Cron      |
-| CLOUDFLARE_API_TOKEN  | ❌ 可选 | Cloudflare API Token；需要目标账户的 `Workers Scripts Write` 权限 |
-| CLOUDFLARE_WORKER_NAME | ❌ 可选 | Cloudflare Workers & Pages 中部署的 Worker 名称            |
-
-配置这三个 Cloudflare Secrets 后，续期成功会把 Worker Cron 更新到当前时刻约 5 分钟后（向上取整到分钟，因此约 5–6 分钟后触发）。Cloudflare Cron 按 UTC、分钟粒度运行；该计划之后每天在同一时刻重复。未配置这些 Secrets 时，续期仍会正常完成，但不会调整定时任务。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -30,9 +27,9 @@
 
 2：在 `Settings` ➡ `Secrets and variables` ➡ `Actions` 中添加单账号所需的 `EMAIL`、`BOT_HOSTING_PASSWORD`，或按下文多账号格式添加 `BOT_HOSTING_ACCOUNTS`。旧的 `DISCORD_TOKEN` 不再使用。
 
-3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署，并为它添加一个初始 Cron Trigger。此 Worker 使用一个 Cron Trigger，续期成功后会用新时间替换该计划。
+3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署。创建一个 Workers KV namespace，并在 Worker 的 Settings → Bindings 中添加 KV Namespace binding，变量名设为 `RENEWAL_STATE`（参见 [Cloudflare KV binding 文档](https://developers.cloudflare.com/kv/concepts/kv-bindings/)）。将现有 Cron Trigger 设为 `0 * * * *`，让 Worker 每小时检查一次账号到期状态；没有账号到期时不会触发 GitHub Actions。若之前有多个 Cron Trigger，保留一个即可。
 
-4：在 Cloudflare Worker 的 Variables / Secrets 里添加以下变量
+4：在 Cloudflare Worker 的 Variables / Secrets 里添加以下变量，并将 `SCHEDULER_AUTH_KEY` 同样添加到 GitHub Actions Secrets：
 
 | 变量名称         | 是否必填 | 说明 |
 |------------------|----------|------|
@@ -40,9 +37,13 @@
 | GH_USER          | ✅ 必填  | GitHub 用户名，例如 `karlxu11` |
 | GH_REPO          | ✅ 必填  | 当前仓库名，例如 `Auto-Renew-Bothosting` |
 | AUTH_KEY         | ✅ 必填  | 手动触发密钥，访问 `https://你的Worker域名/?key=AUTH_KEY` 时使用 |
+| SCHEDULER_AUTH_KEY | ✅ 必填 | Worker 接收续期状态回写的密钥；需与 GitHub Actions Secret 同值 |
+| BOT_HOSTING_ACCOUNT_IDS | ✅ 必填 | 账号 ID，逗号分隔，顺序和多账号配置一致，例如 `account_1,account_2,account_3` |
 | GH_EVENT_TYPE    | ❌ 可选  | 默认 `cf_timer`，需和 workflow 中 `repository_dispatch.types` 一致 |
 | TG_BOT_TOKEN     | ❌ 可选  | Telegram Bot Token，Worker 触发 GitHub Action 后通知 |
 | TG_CHAT_ID       | ❌ 可选  | Telegram Chat ID |
+
+GitHub Actions Secrets 中还需添加 `SCHEDULER_URL`（Worker 的完整 URL）和同值的 `SCHEDULER_AUTH_KEY`。`RENEWAL_STATE` KV 中只保存账号 ID、状态和下次检查时间，不保存邮箱或密码。
 
 ## VPNGate SOCKS5 代理
 
@@ -63,21 +64,22 @@
 该方案依赖 GitHub Actions runner 的 Docker、`privileged` 和 `NET_ADMIN` 网络能力。
 SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
-5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。Cloudflare Cron 首次按上一步设置的计划运行；每次续期成功后，脚本会把它调整为约 5 分钟后的北京时间，并继续每天在该时刻运行。
+5：完成账号 ID、KV binding 和新增 Secrets 配置后，去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 初始化账号时间。KV 中没有记录的账号会在首次 Worker 定时检查时一并处理；之后 Worker 每小时只触发已到期账号，触发时间最多比账号可续期时间晚约一小时。手动 URL 可加 `&account=account_1` 来触发单个账号。
 
 脚本使用邮箱和密码登录；多账号配置见下文。
 
 ### 多账号续期
-在 GitHub Actions Secrets 中添加 `BOT_HOSTING_ACCOUNTS`，值为 JSON 数组。每个账号包含 `email`、`password`；`name` 可选：
+在 GitHub Actions Secrets 中添加 `BOT_HOSTING_ACCOUNTS`，值为 JSON 数组。每个账号包含稳定且唯一的 `id`、`email`、`password`；`name` 可选。每个 `id` 必须和 Worker 的 `BOT_HOSTING_ACCOUNT_IDS` 对应：
 
 ```json
 [
-  {"name":"账号 1","email":"first@example.com","password":"密码一"},
-  {"name":"账号 2","email":"second@example.com","password":"密码二"}
+  {"id":"account_1","name":"账号 1","email":"first@example.com","password":"密码一"},
+  {"id":"account_2","name":"账号 2","email":"second@example.com","password":"密码二"},
+  {"id":"account_3","name":"账号 3","email":"third@example.com","password":"密码三"}
 ]
 ```
 
-账号会按数组顺序逐个使用独立浏览器会话登录和续期。设置 `BOT_HOSTING_ACCOUNTS` 后会忽略单账号的 `EMAIL` 和 `BOT_HOSTING_PASSWORD`。
+账号会按数组顺序逐个使用独立浏览器会话登录和续期。脚本将页面倒计时换算成各自的下次检查时间，并回写 Worker；失败账号会延后 6 小时重试。单账号模式默认使用 ID `account_1`。设置 `BOT_HOSTING_ACCOUNTS` 后会忽略单账号的 `EMAIL` 和 `BOT_HOSTING_PASSWORD`。
 
 ## 注意事项
 * 必填变量必须要填写
@@ -85,7 +87,7 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 * 邮箱密码登录遇到 Cloudflare 验证时会等待验证通过；未通过时本次登录会失败
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
 * 请遵守 Bot-hosting 服务条款，合理使用自动续期
-* Cloudflare Worker 的定时任务只会在续期成功后调整；续期失败或未到续期时间时会保留现有计划
+* Worker 每小时检查一次 KV；未到时间的账号不会启动浏览器或 GitHub Actions
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。
