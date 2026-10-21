@@ -193,8 +193,8 @@ def send_telegram_message(message: str, screenshot_path: str = ""):
         print(f"❌ Telegram 发送失败: {e}")
 
 
-def send_login_step_screenshot(sb, account, step: str):
-    """截图并通过现有 Telegram 配置发送登录步骤；截图时遮住输入框内容。"""
+def save_login_step_screenshot(sb, account, step: str):
+    """仅在本地保存登录步骤截图；截图时遮住输入框内容。"""
     account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
     step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
     screenshot_path = f"login_{account_id}_{step_id}.png"
@@ -231,8 +231,7 @@ def send_login_step_screenshot(sb, account, step: str):
         except Exception:
             pass
 
-    caption = f"🔐 Bot-hosting 登录 | {account.get('name', '账号')} | {step}"
-    send_telegram_message(caption, screenshot_path=screenshot_path)
+    print(f"📸 登录步骤截图已保存: {screenshot_path}")
 
 
 def save_renewal_screenshot(sb, attempt_number: int) -> str:
@@ -339,7 +338,7 @@ def do_email_password_login(sb, account) -> bool:
         sb.uc_open_with_reconnect("https://bot-hosting.net/login", reconnect_time=4)
         sb.wait_for_ready_state_complete()
         sb.sleep(2)
-        send_login_step_screenshot(sb, account, "01_login_page")
+        save_login_step_screenshot(sb, account, "01_login_page")
 
         email_selectors = [
             'input[type="email"]',
@@ -368,28 +367,28 @@ def do_email_password_login(sb, account) -> bool:
                 sb.wait_for_element_visible(email_selectors[0], timeout=15)
                 email_selector = email_selectors[0]
             sb.update_text(email_selector, EMAIL)
-            send_login_step_screenshot(sb, account, "02_email_entered")
+            save_login_step_screenshot(sb, account, "02_email_entered")
             sb.click(continue_selector, timeout=10)
-            send_login_step_screenshot(sb, account, "03_continue_with_email")
+            save_login_step_screenshot(sb, account, "03_continue_with_email")
             sb.wait_for_element_visible(password_selector, timeout=15)
-            send_login_step_screenshot(sb, account, "04_password_page")
+            save_login_step_screenshot(sb, account, "04_password_page")
 
         email_selector = visible_email_selector()
         if email_selector and sb.is_element_visible(email_selector):
             sb.update_text(email_selector, EMAIL)
         sb.update_text(password_selector, BOT_HOSTING_PASSWORD)
-        send_login_step_screenshot(sb, account, "05_credentials_entered")
+        save_login_step_screenshot(sb, account, "05_credentials_entered")
 
         print("⏳ 邮箱和密码已填写，等待 10 秒后点击 Cloudflare 验证框...")
         sb.sleep(10)
-        send_login_step_screenshot(sb, account, "06_wait_10_seconds")
+        save_login_step_screenshot(sb, account, "06_wait_10_seconds")
 
         turnstile_passed = False
         for captcha_attempt in range(1, 4):
             print(f"🔒 点击登录页 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
             try:
                 sb.uc_gui_click_captcha()
-                send_login_step_screenshot(sb, account, f"07_cloudflare_checkbox_clicked_{captcha_attempt}")
+                save_login_step_screenshot(sb, account, f"07_cloudflare_checkbox_clicked_{captcha_attempt}")
             except Exception as e:
                 print(f"⚠️ 点击登录页 Cloudflare 验证框出错: {e}")
 
@@ -398,12 +397,12 @@ def do_email_password_login(sb, account) -> bool:
                 break
 
         if not turnstile_passed:
-            send_login_step_screenshot(sb, account, "07_verification_wait_timeout")
+            save_login_step_screenshot(sb, account, "07_verification_wait_timeout")
             return False
 
-        send_login_step_screenshot(sb, account, "07_verification_passed")
+        save_login_step_screenshot(sb, account, "07_verification_passed")
         sb.click(sign_in_selector, timeout=10)
-        send_login_step_screenshot(sb, account, "08_sign_in_clicked")
+        save_login_step_screenshot(sb, account, "08_sign_in_clicked")
         for _ in range(60):
             current_url = sb.get_current_url()
             parsed_url = urllib.parse.urlparse(current_url)
@@ -413,13 +412,13 @@ def do_email_password_login(sb, account) -> bool:
                 and not parsed_url.path.startswith("/login/")
             ):
                 print("✅ 邮箱和密码登录成功")
-                send_login_step_screenshot(sb, account, "09_login_success")
+                save_login_step_screenshot(sb, account, "09_login_success")
                 return True
             # 有些前端会先更新会话状态，再由后续导航改变 URL。
             # 账单页访问会再次确认会话是否有效。
             if not sb.is_element_visible(password_selector):
                 print("ℹ️ 登录表单已关闭，将通过打开账单页确认登录状态")
-                send_login_step_screenshot(sb, account, "09_login_form_closed")
+                save_login_step_screenshot(sb, account, "09_login_form_closed")
                 return True
             time.sleep(0.5)
 
@@ -436,12 +435,12 @@ def do_email_password_login(sb, account) -> bool:
                 print(f"🔎 登录页面提示: {message}")
         else:
             print("🔎 页面没有提供可识别的登录错误提示；请检查账号密码或登录页截图")
-        send_login_step_screenshot(sb, account, "09_login_failed")
+        save_login_step_screenshot(sb, account, "09_login_failed")
         return False
     except Exception as e:
         print(f"❌ 邮箱和密码登录失败: {e}")
         try:
-            send_login_step_screenshot(sb, account, "error")
+            save_login_step_screenshot(sb, account, "error")
         except Exception:
             pass
         return False
