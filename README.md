@@ -12,10 +12,9 @@
 
 | Secret 名称         | 是否必填 | 说明                                              |
 |---------------------|----------|---------------------------------------------------|
-| EMAIL              | ❌ 可选  | 用于通知使用的Email,可随意填写                          |
-| SESSION_TOKEN      | ❌ 可选  | Bot-hosting session_token，cookie里获取               |
-| DISCORD_TOKEN      | ✅ 必填  | Discord Token，SESSION_TOKEN失效时自动OAuth登录        |
-| GH_TOKEN           | ❌ 可选  | GitHub(classic) token,用于自动更新session_token,以ghp_xxx开头|
+| EMAIL              | 单账号必填 | Bot-hosting 登录邮箱，也用于续期通知                  |
+| BOT_HOSTING_PASSWORD | 单账号必填 | Bot-hosting 登录密码                                 |
+| BOT_HOSTING_ACCOUNTS | ❌ 可选 | 多账号 JSON 配置；设置后优先于单账号配置               |
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
 | CLOUDFLARE_ACCOUNT_ID | ❌ 可选 | Cloudflare Account ID；用于续期成功后调整 Worker Cron      |
@@ -29,7 +28,7 @@
 ## 部署步骤
 1：fork 本项目，在actions菜单允许工作流
 
-2：在`setting`➡`secrets and variables`➡`Actions` 里添加上方必填的secrets
+2：在 `Settings` ➡ `Secrets and variables` ➡ `Actions` 中添加单账号所需的 `EMAIL`、`BOT_HOSTING_PASSWORD`，或按下文多账号格式添加 `BOT_HOSTING_ACCOUNTS`。旧的 `DISCORD_TOKEN` 不再使用。
 
 3：去 Cloudflare Workers 创建一个 Worker，把本项目的 [`workers.js`](workers.js) 内容复制进去并部署，并为它添加一个初始 Cron Trigger。此 Worker 使用一个 Cron Trigger，续期成功后会用新时间替换该计划。
 
@@ -66,41 +65,26 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
 5：去 Actions 菜单手动运行一次，或访问 `https://你的Worker域名/?key=AUTH_KEY` 测试 Cloudflare 触发 GitHub Action。Cloudflare Cron 首次按上一步设置的计划运行；每次续期成功后，脚本会把它调整为约 5 分钟后的北京时间，并继续每天在该时刻运行。
 
-### SESSION_TOKEN 获取
-登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
-<img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/e532b0d6-9f12-45fd-8af9-69e1029a1a92" />
+脚本使用邮箱和密码登录；多账号配置见下文。
 
-### DISCORD_TOKEN 获取（用于 SESSION_TOKEN 失效后备用登录
-1. 浏览器登录 Discord（网页版）
-2. 按 F12 打开开发者工具 ➡ 网络 ➡ 点击任意频道 ➡ 选择左侧的任意api 
-3. 找到名为 `authorization字段` 的 值，即为discord token,详情如图所示
-<img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/7276d62d-31ff-452c-9e13-165af8323f53" />
+### 多账号续期
+在 GitHub Actions Secrets 中添加 `BOT_HOSTING_ACCOUNTS`，值为 JSON 数组。每个账号包含 `email`、`password`；`name` 可选：
 
+```json
+[
+  {"name":"账号 1","email":"first@example.com","password":"密码一"},
+  {"name":"账号 2","email":"second@example.com","password":"密码二"}
+]
+```
 
-> **作用**：当 `SESSION_TOKEN` 过期导致登录失败时，脚本会自动使用 Discord Token 走 OAuth 流程重新登录，并自动更新 `SESSION_TOKEN` Secret，实现永久免维护。
-
-
-### 获取 `GH_TOKEN`(GitHub Personal Access Token)
-1：点击GitHub 账户右上角头像 → Settings（设置）。
-
-2：左侧菜单底部点击 Developer settings（开发者设置）。
-
-3：点击 Personal access tokens → Tokens (classic)。
-
-4：点击 Generate new token → Generate new token (classic)。
-
-填写信息：
-- Note：起一个描述性名称（如 my-token）。
-- Expiration：选择过期时间（建议选No expiration永不过期）。
-- Select scopes：勾选所需权限（不知道如何勾选就全部勾选）。
-- 点击 Generate token，立即复制并妥保存生成的 token（离开页面后不能再查看）。
+账号会按数组顺序逐个使用独立浏览器会话登录和续期。设置 `BOT_HOSTING_ACCOUNTS` 后会忽略单账号的 `EMAIL` 和 `BOT_HOSTING_PASSWORD`。
 
 ## 注意事项
 * 必填变量必须要填写
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
-* Discord OAuth 回调失败时会重新生成 state 和授权码自动重试 1 次
+* 邮箱密码登录遇到 Cloudflare 验证时会等待验证通过；未通过时本次登录会失败
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
-* 自动续期不代表可以无底线的薅羊毛,不建议多账号
+* 请遵守 Bot-hosting 服务条款，合理使用自动续期
 * Cloudflare Worker 的定时任务只会在续期成功后调整；续期失败或未到续期时间时会保留现有计划
 
 ## ⚠️ 免责声明

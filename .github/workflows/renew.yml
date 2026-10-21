@@ -89,9 +89,8 @@ jobs:
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
+          BOT_HOSTING_PASSWORD: ${{ secrets.BOT_HOSTING_PASSWORD }}
+          BOT_HOSTING_ACCOUNTS: ${{ secrets.BOT_HOSTING_ACCOUNTS }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -119,7 +118,7 @@ jobs:
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
           count=0
