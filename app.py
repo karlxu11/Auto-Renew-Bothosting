@@ -317,6 +317,9 @@ def do_email_password_login(sb) -> bool:
             sb.update_text(email_selector, EMAIL)
         sb.update_text(password_selector, BOT_HOSTING_PASSWORD)
 
+        print("⏳ 邮箱和密码已填写，等待 10 秒后继续登录...")
+        sb.sleep(10)
+
         # 不尝试绕过 Turnstile；常规通过时继续，遇到挑战则超时并报告登录失败。
         if not wait_for_turnstile_pass(sb, timeout=30):
             sb.save_screenshot("login_turnstile_timeout.png")
