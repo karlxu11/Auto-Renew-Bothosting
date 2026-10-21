@@ -277,15 +277,31 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
     return "\n".join(lines)
 
 # 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30):
-    start = time.time()
+def wait_for_turnstile_pass(sb, timeout=30, require_token=False):
+    start = time.monotonic()
     cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
-    while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("ℹ️ 页面上已没有检测到 Cloudflare 验证提示")
-            # sb.save_screenshot("turnstile_passed.png")
-            return True
+    while time.monotonic() - start < timeout:
+        if require_token:
+            # 验证框位于跨域 iframe 中，外层页面没有提示文字不代表验证成功。
+            verified = sb.execute_script(
+                """
+                const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
+                if ([...responses].some(el => (el.value || '').trim())) return true;
+                try {
+                  return Boolean(window.turnstile && window.turnstile.getResponse());
+                } catch (_) {
+                  return false;
+                }
+                """
+            )
+            if verified:
+                print("✅ Cloudflare 验证已通过")
+                return True
+        else:
+            page_lower = sb.get_page_source().lower()
+            if not any(x in page_lower for x in cf_indicators):
+                print("ℹ️ 页面上已没有检测到 Cloudflare 验证提示")
+                return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
@@ -313,7 +329,7 @@ def format_countdown(countdown_str: str) -> str:
         return countdown_str
 
 def do_email_password_login(sb, account) -> bool:
-    """通过 Bot-hosting 邮箱和密码登录；如需人工验证则等待验证通过。"""
+    """填写邮箱密码、点击 Cloudflare 复选框，验证通过后提交登录。"""
     if not EMAIL or not BOT_HOSTING_PASSWORD:
         print("⚠️ 未配置 EMAIL 或 BOT_HOSTING_PASSWORD，跳过邮箱登录")
         return False
@@ -364,15 +380,28 @@ def do_email_password_login(sb, account) -> bool:
         sb.update_text(password_selector, BOT_HOSTING_PASSWORD)
         send_login_step_screenshot(sb, account, "05_credentials_entered")
 
-        print("⏳ 邮箱和密码已填写，等待 10 秒后继续登录...")
+        print("⏳ 邮箱和密码已填写，等待 10 秒后点击 Cloudflare 验证框...")
         sb.sleep(10)
         send_login_step_screenshot(sb, account, "06_wait_10_seconds")
 
-        # 不尝试绕过 Turnstile；常规通过时继续，遇到挑战则超时并报告登录失败。
-        if not wait_for_turnstile_pass(sb, timeout=30):
+        turnstile_passed = False
+        for captcha_attempt in range(1, 4):
+            print(f"🔒 点击登录页 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
+            try:
+                sb.uc_gui_click_captcha()
+                send_login_step_screenshot(sb, account, f"07_cloudflare_checkbox_clicked_{captcha_attempt}")
+            except Exception as e:
+                print(f"⚠️ 点击登录页 Cloudflare 验证框出错: {e}")
+
+            if wait_for_turnstile_pass(sb, timeout=30, require_token=True):
+                turnstile_passed = True
+                break
+
+        if not turnstile_passed:
             send_login_step_screenshot(sb, account, "07_verification_wait_timeout")
             return False
 
+        send_login_step_screenshot(sb, account, "07_verification_passed")
         sb.click(sign_in_selector, timeout=10)
         send_login_step_screenshot(sb, account, "08_sign_in_clicked")
         for _ in range(60):
