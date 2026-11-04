@@ -1,4 +1,6 @@
 name: Auto Renew Bot-hosting
+run-name: >-
+  续期 · ${{ inputs.account_ids || (github.event.client_payload.account_ids && (join(github.event.client_payload.account_ids, ', ') || '无账号')) || '全部账号' }}
 
 on:
   
@@ -8,6 +10,12 @@ on:
 
   # 保留 GitHub 网页上的手动运行入口
   workflow_dispatch:
+    inputs:
+      account_ids:
+        description: '续期账号 ID，多个用逗号分隔（如 account_1,account_2）；留空处理全部账号'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   Renew-bot:
@@ -15,6 +23,9 @@ jobs:
     permissions:
       actions: write
       contents: read
+    env:
+      IS_PROXY: 'false'
+      PROXY_SERVER: ''
 
     steps:
       - uses: actions/checkout@v6
@@ -24,6 +35,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: 🧾 确认本次续期账号
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          BOT_HOSTING_PASSWORD: ${{ secrets.BOT_HOSTING_PASSWORD }}
+          BOT_HOSTING_ACCOUNTS: ${{ secrets.BOT_HOSTING_ACCOUNTS }}
+          SELECTED_ACCOUNT_IDS: ${{ github.event_name == 'repository_dispatch' && toJSON(github.event.client_payload.account_ids) || inputs.account_ids || '' }}
+        run: python3 accounts.py
+
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
@@ -32,6 +51,8 @@ jobs:
           seleniumbase install chromedriver
 
       - name: 📥 准备 VPNGate SOCKS 服务
+        id: vpngate_prepare
+        continue-on-error: true
         env:
           VPNGATE_TO_SOCKS_REF: 337dbaffbfdf69df65f0fc8bdcf6517e45ca18db
         run: |
@@ -40,8 +61,12 @@ jobs:
           git -C vpngate-to-socks fetch --depth 1 origin "$VPNGATE_TO_SOCKS_REF"
           git -C vpngate-to-socks checkout --detach "$VPNGATE_TO_SOCKS_REF"
           git -C vpngate-to-socks apply "$GITHUB_WORKSPACE/.github/vpngate-selection.patch"
+          git -C vpngate-to-socks apply "$GITHUB_WORKSPACE/.github/vpngate-recovery.patch"
 
       - name: 🧱 预拉取 VPNGate 构建镜像
+        id: vpngate_images
+        if: steps.vpngate_prepare.outcome == 'success'
+        continue-on-error: true
         run: |
           set -euo pipefail
 
@@ -64,6 +89,9 @@ jobs:
           done
 
       - name: 🚇 构建并启动 VPNGate SOCKS5 代理
+        id: vpngate_start
+        if: steps.vpngate_images.outcome == 'success'
+        continue-on-error: true
         env:
           VPNGATE_COUNTRY: JP
           VPNGATE_EXCLUDE_KEYWORD: public
@@ -78,20 +106,34 @@ jobs:
             up -d
 
       - name: 🔎 等待 VPNGate 节点连接
+        id: vpngate_wait
+        if: steps.vpngate_start.outcome == 'success'
+        continue-on-error: true
         env:
           VPNGATE_WAIT_SECONDS: '300'
         run: |
           set -euo pipefail
           python3 scripts/wait_for_vpngate.py
-          echo "IS_PROXY=true" >> "$GITHUB_ENV"
-          echo "PROXY_SERVER=socks5://127.0.0.1:10080" >> "$GITHUB_ENV"
+
+      - name: 🌐 选择续期网络
+        env:
+          VPNGATE_OUTCOME: ${{ steps.vpngate_wait.outcome }}
+        run: |
+          if [ "$VPNGATE_OUTCOME" = "success" ]; then
+            echo "IS_PROXY=true" >> "$GITHUB_ENV"
+            echo "PROXY_SERVER=socks5://127.0.0.1:10080" >> "$GITHUB_ENV"
+            echo "VPNGate 代理已就绪，使用代理继续续期。"
+          else
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            echo "PROXY_SERVER=" >> "$GITHUB_ENV"
+            echo "::warning::VPNGate 准备、启动或连接失败，改用 GitHub Actions runner 直连继续续期。"
+          fi
 
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
           BOT_HOSTING_PASSWORD: ${{ secrets.BOT_HOSTING_PASSWORD }}
           BOT_HOSTING_ACCOUNTS: ${{ secrets.BOT_HOSTING_ACCOUNTS }}
-          SELECTED_ACCOUNT_IDS: ${{ github.event_name == 'repository_dispatch' && toJSON(github.event.client_payload.account_ids) || '' }}
           SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
           SCHEDULER_AUTH_KEY: ${{ secrets.SCHEDULER_AUTH_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}

@@ -1,0 +1,113 @@
+diff --git a/internal/runner/runner.go b/internal/runner/runner.go
+index ab3e21f..dbd2296 100644
+--- a/internal/runner/runner.go
++++ b/internal/runner/runner.go
+@@ -459,12 +459,16 @@ func (r *Runner) waitOpenVPN(cmd *exec.Cmd, writer *io.PipeWriter, scanDone <-ch
+ 		}
+ 	}
+ 
+-	if waitErr != nil || timedOutBeforeHandshake {
++	// OpenVPN may exit with code 0 after AUTH_FAILED. A process that never
++	// completed the handshake is still a failed node and must be quarantined.
++	if waitErr != nil || !handshakeSeen {
+ 		if strings.TrimSpace(detail) == "" {
+ 			if timedOutBeforeHandshake {
+ 				detail = fmt.Sprintf("连接握手超时，超过 %s", connectTimeout.Round(time.Second))
+-			} else {
++			} else if waitErr != nil {
+ 				detail = waitErr.Error()
++			} else {
++				detail = "OpenVPN 在完成连接握手前退出"
+ 			}
+ 		}
+ 
+diff --git a/internal/runner/runner_recovery_test.go b/internal/runner/runner_recovery_test.go
+new file mode 100644
+index 0000000..5b9af2b
+--- /dev/null
++++ b/internal/runner/runner_recovery_test.go
+@@ -0,0 +1,84 @@
++package runner
++
++import (
++	"io"
++	"log"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"vpngate/internal/vpngate"
++)
++
++func TestWaitOpenVPNQuarantinesExitBeforeHandshake(t *testing.T) {
++	t.Setenv("VPNGATE_COUNTRY", "")
++	t.Setenv("VPNGATE_EXCLUDE_KEYWORD", "")
++
++	tests := []struct {
++		name       string
++		lines      []string
++		handshake  bool
++		disconnect bool
++		wantFailed bool
++		wantError  string
++	}{
++		{name: "auth failure with exit zero", lines: []string{"AUTH: Received control message: AUTH_FAILED", "SIGTERM[soft,auth-failure] received, process exiting"}, wantFailed: true, wantError: "AUTH_FAILED"},
++		{name: "exit zero without handshake or logs", wantFailed: true, wantError: "握手前退出"},
++		{name: "requested disconnect", disconnect: true},
++		{name: "clean exit after handshake", handshake: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cmd := exec.Command("sh", "-c", "exit 0")
++			if err := cmd.Start(); err != nil {
++				t.Fatal(err)
++			}
++			config, err := os.CreateTemp(t.TempDir(), "*.ovpn")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := config.Close(); err != nil {
++				t.Fatal(err)
++			}
++			reader, writer := io.Pipe()
++			defer reader.Close()
++			scanDone := make(chan openVPNScanResult, 1)
++			scanDone <- openVPNScanResult{lines: tt.lines}
++			bad := vpngate.Server{HostName: "bad", IP: "192.0.2.1", CountryShort: "JP", TotalUsers: 1, OpenVPNConfigDataBase64: "config"}
++			good := vpngate.Server{HostName: "good", IP: "192.0.2.2", CountryShort: "JP", TotalUsers: 2, OpenVPNConfigDataBase64: "config"}
++			summary := &ConnectionInfo{HostName: bad.HostName, IP: bad.IP}
++			r := &Runner{
++				logger:               log.New(io.Discard, "", 0),
++				proc:                 cmd,
++				current:              summary,
++				state:                StateConnecting,
++				quarantine:           make(map[string]nodeHealth),
++				autoConfig:           AutoPilotConfig{BaseQuarantine: time.Minute}.withDefaults(),
++				connectHandshakeSeen: tt.handshake,
++				disconnectRequested:  tt.disconnect,
++			}
++			r.waitOpenVPN(cmd, writer, scanDone, config.Name(), summary)
++			if tt.wantFailed {
++				if r.state != StateFailed || r.current != summary || !strings.Contains(r.lastError, tt.wantError) {
++					t.Fatalf("state=%s current=%v error=%q", r.state, r.current, r.lastError)
++				}
++				health := r.quarantine[nodeKey(bad.HostName, bad.IP)]
++				if health.FailureCount != 1 || !health.QuarantinedUntil.After(time.Now()) {
++					t.Fatalf("failed node was not quarantined: %+v", health)
++				}
++				next, err := r.selectCandidate([]vpngate.Server{bad, good})
++				if err != nil || next.HostName != good.HostName {
++					t.Fatalf("next candidate=%s error=%v, want good node", next.HostName, err)
++				}
++			} else if r.state != StateDisconnected || len(r.quarantine) != 0 {
++				t.Fatalf("expected normal disconnect without quarantine: state=%s quarantine=%v", r.state, r.quarantine)
++			}
++			if _, err := os.Stat(config.Name()); !os.IsNotExist(err) {
++				t.Fatalf("temporary config was not removed: %v", err)
++			}
++		})
++	}
++}

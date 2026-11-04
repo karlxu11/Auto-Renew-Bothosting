@@ -5,6 +5,7 @@ import os, re, sys, time, json, requests, html
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
+from accounts import load_accounts, select_accounts
 
 # 通过 GitHub Actions Secrets 等环境变量配置账号信息，不要写入源码。
 EMAIL         = os.environ.get("EMAIL") or ""           # Bot-hosting 登录邮箱，也用于通知
@@ -14,7 +15,6 @@ TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写�
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
 SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "").strip().rstrip("/")
 SCHEDULER_AUTH_KEY = os.environ.get("SCHEDULER_AUTH_KEY") or ""
-SELECTED_ACCOUNT_IDS = os.environ.get("SELECTED_ACCOUNT_IDS", "").strip()
 
 if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
     print("ℹ️ 请配置 BOT_HOSTING_ACCOUNTS，或配置 EMAIL 与 BOT_HOSTING_PASSWORD。脚本终止。")
@@ -23,79 +23,6 @@ if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
 # 记录本次登录方式（用于通知）
 _LOGIN_METHOD = "Email + Password"
 _ACCOUNT_NAME = ""
-
-
-def load_accounts():
-    """从多账号 JSON Secret 或旧版单账号环境变量加载账号。"""
-    if BOT_HOSTING_ACCOUNTS:
-        try:
-            raw_accounts = json.loads(BOT_HOSTING_ACCOUNTS)
-        except json.JSONDecodeError as e:
-            raise ValueError("BOT_HOSTING_ACCOUNTS 必须是有效的 JSON 数组") from e
-
-        if not isinstance(raw_accounts, list) or not raw_accounts:
-            raise ValueError("BOT_HOSTING_ACCOUNTS 必须是非空 JSON 数组")
-
-        accounts = []
-        for index, raw_account in enumerate(raw_accounts, start=1):
-            if not isinstance(raw_account, dict):
-                raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项必须是对象")
-
-            account_id = str(raw_account.get("id") or f"account_{index}").strip()
-            email = str(raw_account.get("email") or "").strip()
-            password = str(raw_account.get("password") or "")
-            name = str(raw_account.get("name") or f"账号 {index}").strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account_id):
-                raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项的 id 格式无效")
-            if not email:
-                raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项缺少 email")
-            if not password:
-                raise ValueError(f"BOT_HOSTING_ACCOUNTS 第 {index} 项缺少 password")
-
-            accounts.append({
-                "id": account_id,
-                "name": name or f"账号 {index}",
-                "email": email,
-                "password": password,
-            })
-        ids = [account["id"] for account in accounts]
-        if len(ids) != len(set(ids)):
-            raise ValueError("BOT_HOSTING_ACCOUNTS 中的 id 必须唯一")
-        return accounts
-
-    if not EMAIL or not BOT_HOSTING_PASSWORD:
-        raise ValueError("单账号登录需要同时配置 EMAIL 和 BOT_HOSTING_PASSWORD")
-
-    return [{
-        "id": "account_1",
-        "name": "账号 1",
-        "email": EMAIL,
-        "password": BOT_HOSTING_PASSWORD,
-    }]
-
-
-def select_accounts(accounts):
-    """按 Worker 事件中的账号 ID 筛选；人工运行未指定时处理全部账号。"""
-    raw_ids = SELECTED_ACCOUNT_IDS
-    if not raw_ids or raw_ids == "null":
-        return accounts
-
-    try:
-        selected_ids = json.loads(raw_ids)
-    except json.JSONDecodeError as e:
-        raise ValueError("SELECTED_ACCOUNT_IDS 必须是 JSON 数组") from e
-    if selected_ids is None:
-        return accounts
-    if not isinstance(selected_ids, list) or any(not isinstance(item, str) for item in selected_ids):
-        raise ValueError("SELECTED_ACCOUNT_IDS 必须是字符串数组")
-    if not selected_ids:
-        return []
-
-    account_by_id = {account["id"]: account for account in accounts}
-    unknown_ids = sorted(set(selected_ids) - account_by_id.keys())
-    if unknown_ids:
-        raise ValueError(f"触发事件包含未知账号 ID: {', '.join(unknown_ids)}")
-    return [account_by_id[account_id] for account_id in dict.fromkeys(selected_ids)]
 
 
 def countdown_to_seconds(countdown: str):
@@ -750,6 +677,8 @@ def main():
         print("ℹ️ 本次没有选中的账号，无需处理。")
         return
 
+    print(f"🧾 本次选中账号 ID: {', '.join(account['id'] for account in accounts)}")
+
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
@@ -763,7 +692,7 @@ def main():
 
     failed_accounts = 0
     for index, account in enumerate(accounts, start=1):
-        print(f"\n========== 开始续期账号 {index}/{len(accounts)} ==========")
+        print(f"\n========== 开始续期账号 {index}/{len(accounts)} · {account['id']} ==========")
         result = {"status": "failed"}
         try:
             result = renew_account(account, sb_kwargs, proxy_server, is_proxy) or result

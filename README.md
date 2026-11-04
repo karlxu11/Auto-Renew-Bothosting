@@ -54,6 +54,9 @@ GitHub Actions Secrets 中还需添加 `SCHEDULER_URL`（Worker 的完整 URL）
 - 默认只保留日本节点；
 - 默认排除节点名称中包含 `public` 的节点；
 - 自动探测 Bot-hosting 连通性，失败后自动切换节点；
+- 未完成握手就退出的节点（包括 `AUTH_FAILED` 后以退出码 0 结束）也会隔离，避免反复连接同一个坏节点；
+- 最多等待连接 300 秒，确认 SOCKS5 能访问目标站后才启用代理；
+- VPNGate 下载、构建、启动或连接失败时，自动使用 GitHub Actions runner 直连，继续执行登录、续期和调度回写；
 - 不再使用 `NODE_LINK` 或远程 sing-box 脚本。
 
 筛选条件可在 `.github/workflows/renew.yml` 的“启动 VPNGate SOCKS5 代理”步骤中修改：
@@ -81,9 +84,25 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
 账号会按数组顺序逐个使用独立浏览器会话登录和续期。脚本将页面倒计时换算成各自的下次检查时间，并回写 Worker；失败账号会延后 6 小时重试。单账号模式默认使用 ID `account_1`。设置 `BOT_HOSTING_ACCOUNTS` 后会忽略单账号的 `EMAIL` 和 `BOT_HOSTING_PASSWORD`。
 
+### 手动选择账号与重跑
+
+进入 Actions → Auto Renew Bot-hosting → **Run workflow**，选择 `main` 分支，在 `account_ids` 中填写：
+
+- `account_1`：只处理这个账号；
+- `account_1,account_2`：处理指定的多个账号；
+- 留空：处理全部已配置账号。
+
+账号 ID 对应 `BOT_HOSTING_ACCOUNTS` 中的 `id`，单账号配置使用 `account_1`。
+运行标题会显示指定的账号 ID（手动留空时显示“全部账号”）；运行开始后，“确认本次续期账号”步骤和 Summary 会列出实际选中的账号 ID。
+账号不存在或输入无效时，会在安装依赖和连接 VPN 之前报错。
+
+**Re-run jobs 会沿用原事件的账号选择和原提交，不能修改账号范围。** 要更换账号或使用刚推送的修复，请从 `main` 分支重新点击 **Run workflow**。
+参见 [GitHub 重跑说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)。
+
 ## 注意事项
 * 必填变量必须要填写
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
+* VPNGate 不可用时仍会直连尝试续期；直连出口同样可能受到目标站的 Cloudflare 限制
 * 邮箱密码填写完成后等待 10 秒，再点击 Cloudflare 验证复选框；最多尝试 3 次，确认验证通过后才点击 Sign in，未通过时本次登录会失败
 * 登录步骤截图仅保存在运行环境本地，不发送 Telegram；续期结果通知和截图仍按 Telegram 配置发送
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
