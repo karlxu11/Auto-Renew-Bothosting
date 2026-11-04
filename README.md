@@ -99,6 +99,22 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 **Re-run jobs 会沿用原事件的账号选择和原提交，不能修改账号范围。** 要更换账号或使用刚推送的修复，请从 `main` 分支重新点击 **Run workflow**。
 参见 [GitHub 重跑说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)。
 
+### 查看账号续期计划
+
+把更新后的 `workers.js` 部署到现有 Cloudflare Worker 后，访问：
+
+```text
+https://你的Worker地址/schedules?key=AUTH_KEY的值
+```
+
+页面沿用现有的 `AUTH_KEY` 和 `RENEWAL_STATE` KV binding，无需新增变量。
+它会列出当前配置的全部账号，以及 KV 中 `renewal-account:` 前缀下保留的旧账号，显示调度状态、上次结果、下次检查、最近更新和占用截止时间。**所有时间均为 UTC。**
+
+- 配置中存在但还没有 KV 记录的账号显示“待初始化”；旧账号显示“未配置”，不参与调度。
+- “占用中”表示调度占用期限尚未结束，不代表 GitHub Actions 的实时状态。
+- 页面只读，点击“刷新”重新读取计划，不会触发续期或改写 KV。到期后仍由下一次定时检查触发续期。
+- KV 列表和读取存在短暂延迟，刚回写的计划可能需要稍后刷新才能看到。
+
 ## 注意事项
 * 必填变量必须要填写
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证

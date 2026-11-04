@@ -23,6 +23,10 @@ export default {
       return new Response("Unauthorized: use ?key=YOUR_AUTH_KEY", { status: 401 });
     }
 
+    if (url.pathname === "/schedules" || url.pathname === "/schedules/") {
+      return showSchedules(request, env);
+    }
+
     try {
       const accountIds = getAccountIds(env);
       const requestedAccountId = url.searchParams.get("account");
@@ -59,6 +63,195 @@ export default {
     }
   },
 };
+
+const SCHEDULE_HEADERS = {
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+
+async function showSchedules(request, env) {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("仅支持 GET 和 HEAD 请求", {
+      status: 405,
+      headers: { ...SCHEDULE_HEADERS, Allow: "GET, HEAD", "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+  if (!env.RENEWAL_STATE) {
+    return new Response("请先为 Worker 添加名为 RENEWAL_STATE 的 KV binding。", {
+      status: 503,
+      headers: { ...SCHEDULE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  try {
+    const configuredIds = getAccountIds(env);
+    const configured = new Set(configuredIds);
+    const storedIds = new Set();
+    let cursor;
+    do {
+      const page = await env.RENEWAL_STATE.list({ prefix: STATE_PREFIX, ...(cursor ? { cursor } : {}) });
+      for (const key of page.keys) {
+        storedIds.add(key.name.slice(STATE_PREFIX.length));
+      }
+      if (page.list_complete) break;
+      if (!page.cursor || page.cursor === cursor) throw new Error("KV 列表分页缺少有效游标");
+      cursor = page.cursor;
+    } while (true);
+
+    const accountIds = [...configuredIds, ...[...storedIds].filter((id) => !configured.has(id)).sort()];
+    const records = [];
+    // 分批读取，避免账号较多时一次创建过多并发请求。
+    for (let offset = 0; offset < accountIds.length; offset += 25) {
+      const batch = await Promise.all(accountIds.slice(offset, offset + 25).map(async (id) => {
+        const raw = await env.RENEWAL_STATE.get(stateKey(id));
+        let state = null;
+        let invalid = false;
+        if (raw !== null) {
+          try {
+            state = JSON.parse(raw);
+            invalid = !state || typeof state !== "object" || Array.isArray(state);
+          } catch {
+            invalid = true;
+          }
+        }
+        return { id, configured: configured.has(id), state: invalid ? null : state, invalid };
+      }));
+      records.push(...batch);
+    }
+
+    const html = renderSchedules(records, new Date());
+    return new Response(request.method === "HEAD" ? null : html, { headers: SCHEDULE_HEADERS });
+  } catch (error) {
+    console.error("读取账号计划失败：", error.message);
+    return new Response("读取账号计划失败，请检查 KV binding 和 BOT_HOSTING_ACCOUNT_IDS 配置后重试。", {
+      status: 500,
+      headers: { ...SCHEDULE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+}
+
+function scheduleStatus(record, now) {
+  if (!record.configured) return { label: "未配置", kind: "muted" };
+  if (record.invalid) return { label: "记录异常", kind: "danger" };
+  if (parseScheduleTime(record.state?.in_flight_until) > now) return { label: "占用中", kind: "active" };
+  if (!record.state) return { label: "待初始化", kind: "due" };
+  if (parseScheduleTime(record.state.next_run_at) > now) return { label: "等待中", kind: "waiting" };
+  return { label: "待检查", kind: "due" };
+}
+
+function parseScheduleTime(value) {
+  return typeof value === "string" ? Date.parse(value) : NaN;
+}
+
+function renderUTCTime(value) {
+  if (value === null || value === undefined || value === "") return '<span class="empty">—</span>';
+  const timestamp = parseScheduleTime(value);
+  if (!Number.isFinite(timestamp)) return '<span class="empty">无效时间</span>';
+  const iso = new Date(timestamp).toISOString();
+  const label = iso.replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  return `<time datetime="${iso}">${label}</time>`;
+}
+
+function renderSchedules(records, now) {
+  const results = { success: "续期成功", not_due: "尚未到期", failed: "续期失败" };
+  const statuses = records.map((record) => scheduleStatus(record, now.getTime()));
+  const due = statuses.filter((status) => status.kind === "due").length;
+  const active = statuses.filter((status) => status.kind === "active").length;
+  const rows = records.map((record, index) => {
+    const status = statuses[index];
+    const result = record.state?.status;
+    let resultLabel = "未回写";
+    if (typeof result === "string" && result) {
+      resultLabel = Object.hasOwn(results, result) ? results[result] : `未知（${result}）`;
+    } else if (result !== undefined && result !== null) {
+      resultLabel = "未知结果";
+    }
+    return `<tr>
+      <td><strong class="account">${escapeHtml(record.id)}</strong>${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
+      <td><span class="badge ${status.kind}">${status.label}</span></td>
+      <td>${escapeHtml(resultLabel)}</td>
+      <td>${renderUTCTime(record.state?.next_run_at)}</td>
+      <td>${renderUTCTime(record.state?.updated_at)}</td>
+      <td>${renderUTCTime(record.state?.in_flight_until)}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账号续期计划 · Bot-hosting</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #172b39; background: #f4f7f8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 56px 28px; }
+    main { max-width: 1280px; margin: auto; }
+    .eyebrow { margin: 0 0 12px; color: #39756c; font-size: 12px; font-weight: 700; letter-spacing: .14em; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 30px; }
+    h1 { margin: 0 0 10px; font-size: 30px; letter-spacing: -.03em; }
+    .description, footer { color: #61727d; font-size: 14px; line-height: 1.8; }
+    .description { margin: 0; }
+    .refresh { flex-shrink: 0; padding: 10px 19px; border: 1px solid #cbd8dd; border-radius: 8px; color: #264c49; background: white; font-size: 14px; font-weight: 600; text-decoration: none; }
+    .refresh:hover { background: #eaf3f0; border-color: #78a89a; }
+    .refresh:focus-visible { outline: 3px solid #68ac99; outline-offset: 3px; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
+    .stat { border: 1px solid #dfe7ea; border-radius: 12px; background: white; padding: 21px 24px; }
+    .stat dt { color: #61727d; font-size: 13px; }
+    .stat dd { margin: 9px 0 0; font-size: 30px; font-weight: 650; font-variant-numeric: tabular-nums; }
+    .stat:nth-child(2) dd { color: #996716; }
+    .stat:nth-child(3) dd { color: #216c62; }
+    .table-panel { overflow: hidden; background: white; border: 1px solid #dfe7ea; border-radius: 12px; }
+    .table-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 22px 24px; }
+    h2 { font-size: 16px; margin: 0; }
+    .zone { font-size: 12px; font-weight: 600; color: #39756c; background: #edf5f1; padding: 5px 9px; border-radius: 5px; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; white-space: nowrap; font-size: 13px; }
+    th { color: #627780; font-size: 12px; font-weight: 600; background: #f7f9fa; }
+    th, td { padding: 17px 20px; border-top: 1px solid #e8eef0; }
+    th:first-child, td:first-child { padding-left: 24px; }
+    tbody tr:hover { background: #fafcfb; }
+    .account { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
+    .subtext { display: block; color: #87949d; font-size: 11px; margin-top: 6px; }
+    time { font-variant-numeric: tabular-nums; font-size: 12px; }
+    .empty { color: #91a0a8; }
+    .badge { display: inline-block; padding: 4px 9px; border-radius: 5px; font-size: 12px; font-weight: 500; }
+    .waiting { background: #edf3fa; color: #3b6593; }
+    .active { background: #e7f4ee; color: #257455; }
+    .due { background: #fcf3de; color: #946516; }
+    .danger { background: #fceceb; color: #b74d48; }
+    .muted { background: #f0f2f4; color: #7b858d; }
+    footer { margin-top: 22px; font-size: 12px; }
+    footer p { margin: 5px 0; }
+    @media (max-width: 600px) { body { padding: 28px 16px; } h1 { font-size: 25px; } header { align-items: flex-start; } .stats { gap: 10px; } .stat { padding: 17px 15px; } .stat dd { font-size: 26px; } .description time { display: block; } .table-heading { padding: 18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">BOT-HOSTING / SCHEDULES</p>
+    <header>
+      <div><h1>账号续期计划</h1><p class="description">查看各账号的下次检查时间。当前时间：${renderUTCTime(now.toISOString())}</p></div>
+      <a class="refresh" href="">刷新</a>
+    </header>
+    <dl class="stats" aria-label="计划概览">
+      <div class="stat"><dt>账号总数</dt><dd>${records.length}</dd></div>
+      <div class="stat"><dt>待检查 / 待初始化</dt><dd>${due}</dd></div>
+      <div class="stat"><dt>占用中</dt><dd>${active}</dd></div>
+    </dl>
+    <section class="table-panel" aria-labelledby="schedule-heading">
+      <div class="table-heading"><h2 id="schedule-heading">全部账号</h2><span class="zone">所有时间均为 UTC</span></div>
+      <div class="table-scroll" role="region" aria-label="账号计划表，可横向滚动" tabindex="0">
+        <table><thead><tr><th scope="col">账号 ID</th><th scope="col">调度状态</th><th scope="col">上次结果</th><th scope="col">下次检查 (UTC)</th><th scope="col">最近更新 (UTC)</th><th scope="col">占用截止 (UTC)</th></tr></thead><tbody>${rows}</tbody></table>
+      </div>
+    </section>
+    <footer><p>页面只读。到期的账号会在下一次定时检查时尝试触发；KV 更新可能有短暂延迟。</p><p>“占用中”按调度占用期限判断，不代表 GitHub Actions 的实时状态。未配置的旧账号仅供查看。</p></footer>
+  </main>
+</body>
+</html>`;
+}
 
 async function dispatchDueAccounts(env) {
   try {
