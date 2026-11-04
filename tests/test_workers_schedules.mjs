@@ -34,7 +34,7 @@ function fixture(values = {}, pages) {
 }
 
 const request = (path = `/schedules?key=${KEY}`, method = "GET") => new Request(`https://worker.example.invalid${path}`, { method });
-const rowFor = (html, id) => [...html.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].find((row) => row[1].includes(`>${id}</strong>`))?.[1];
+const rowFor = (html, id) => [...html.matchAll(/<tr data-account-id="([^"]*)">([\s\S]*?)<\/tr>/g)].find((row) => row[1] === id)?.[2];
 
 test("schedules requires the existing AUTH_KEY before any KV reads", async () => {
   const { env, calls } = fixture();
@@ -55,6 +55,9 @@ test("lists configured accounts, historical KV accounts, and missing records wit
   const response = await worker.fetch(request(), env);
   const html = await response.text();
   assert.equal(response.status, 200);
+  assert.match(rowFor(html, "account_1"), />karlxu28<\/strong>/);
+  assert.match(rowFor(html, "account_2"), />karlxu0<\/strong>/);
+  assert.match(rowFor(html, "account_3"), />karlzhe<\/strong>/);
   assert.match(rowFor(html, "account_1"), /等待中/);
   assert.match(rowFor(html, "account_2"), /待初始化/);
   assert.match(rowFor(html, "account_3"), /待初始化/);
@@ -82,7 +85,7 @@ test("KV pagination continues through empty pages", async () => {
   ]);
 });
 
-test("all stored time fields are normalized to UTC", async () => {
+test("all stored time fields are displayed in Beijing time", async () => {
   const { env } = fixture({
     [`${PREFIX}account_1`]: JSON.stringify({
       status: "not_due",
@@ -93,10 +96,26 @@ test("all stored time fields are normalized to UTC", async () => {
   });
   const html = await (await worker.fetch(request(), env)).text();
   const row = rowFor(html, "account_1");
-  assert.match(row, />2026-11-04 09:30:00 UTC<\/time>/);
-  assert.match(row, />2026-11-04 08:20:00 UTC<\/time>/);
-  assert.match(row, />2026-11-04 10:00:00 UTC<\/time>/);
-  assert.doesNotMatch(row, /17:30|01:20/);
+  assert.match(row, /datetime="2026-11-04T09:30:00.000Z">2026-11-04 17:30:00 北京时间<\/time>/);
+  assert.match(row, />2026-11-04 16:20:00 北京时间<\/time>/);
+  assert.match(row, />2026-11-04 18:00:00 北京时间<\/time>/);
+  assert.match(html, /北京时间（UTC\+8）/);
+  assert.doesNotMatch(html, /所有时间均为 UTC|\(UTC\)/);
+});
+
+test("Beijing time conversion handles midnight and year rollover", async () => {
+  const { env } = fixture({
+    [`${PREFIX}account_1`]: JSON.stringify({
+      next_run_at: "2026-12-31T16:00:00Z",
+      updated_at: "2026-11-04T15:59:59Z",
+      in_flight_until: "2026-11-04T16:00:00Z",
+    }),
+  });
+  const html = await (await worker.fetch(request(), env)).text();
+  const row = rowFor(html, "account_1");
+  assert.match(row, />2027-01-01 00:00:00 北京时间<\/time>/);
+  assert.match(row, />2026-11-04 23:59:59 北京时间<\/time>/);
+  assert.match(row, />2026-11-05 00:00:00 北京时间<\/time>/);
 });
 
 test("active leases take precedence over due dates, expired leases do not", async () => {

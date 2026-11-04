@@ -72,6 +72,18 @@ const SCHEDULE_HEADERS = {
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 };
 
+const SCHEDULE_ACCOUNT_NAMES = {
+  account_1: "karlxu28",
+  account_2: "karlxu0",
+  account_3: "karlzhe",
+};
+const SCHEDULE_TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hourCycle: "h23",
+});
+
 async function showSchedules(request, env) {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("仅支持 GET 和 HEAD 请求", {
@@ -146,12 +158,13 @@ function parseScheduleTime(value) {
   return typeof value === "string" ? Date.parse(value) : NaN;
 }
 
-function renderUTCTime(value) {
+function renderBeijingTime(value) {
   if (value === null || value === undefined || value === "") return '<span class="empty">—</span>';
   const timestamp = parseScheduleTime(value);
   if (!Number.isFinite(timestamp)) return '<span class="empty">无效时间</span>';
   const iso = new Date(timestamp).toISOString();
-  const label = iso.replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  const parts = Object.fromEntries(SCHEDULE_TIME_FORMAT.formatToParts(new Date(timestamp)).map(({ type, value }) => [type, value]));
+  const label = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} 北京时间`;
   return `<time datetime="${iso}">${label}</time>`;
 }
 
@@ -161,6 +174,7 @@ function renderSchedules(records, now) {
   const due = statuses.filter((status) => status.kind === "due").length;
   const active = statuses.filter((status) => status.kind === "active").length;
   const rows = records.map((record, index) => {
+    const name = Object.hasOwn(SCHEDULE_ACCOUNT_NAMES, record.id) ? SCHEDULE_ACCOUNT_NAMES[record.id] : record.id;
     const status = statuses[index];
     const result = record.state?.status;
     let resultLabel = "未回写";
@@ -169,13 +183,13 @@ function renderSchedules(records, now) {
     } else if (result !== undefined && result !== null) {
       resultLabel = "未知结果";
     }
-    return `<tr>
-      <td><strong class="account">${escapeHtml(record.id)}</strong>${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
+    return `<tr data-account-id="${escapeHtml(record.id)}">
+      <td><strong class="account">${escapeHtml(name)}</strong>${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
       <td><span class="badge ${status.kind}">${status.label}</span></td>
       <td>${escapeHtml(resultLabel)}</td>
-      <td>${renderUTCTime(record.state?.next_run_at)}</td>
-      <td>${renderUTCTime(record.state?.updated_at)}</td>
-      <td>${renderUTCTime(record.state?.in_flight_until)}</td>
+      <td>${renderBeijingTime(record.state?.next_run_at)}</td>
+      <td>${renderBeijingTime(record.state?.updated_at)}</td>
+      <td>${renderBeijingTime(record.state?.in_flight_until)}</td>
     </tr>`;
   }).join("");
 
@@ -233,7 +247,7 @@ function renderSchedules(records, now) {
   <main>
     <p class="eyebrow">BOT-HOSTING / SCHEDULES</p>
     <header>
-      <div><h1>账号续期计划</h1><p class="description">查看各账号的下次检查时间。当前时间：${renderUTCTime(now.toISOString())}</p></div>
+      <div><h1>账号续期计划</h1><p class="description">查看各账号的下次检查时间。当前时间：${renderBeijingTime(now.toISOString())}</p></div>
       <a class="refresh" href="">刷新</a>
     </header>
     <dl class="stats" aria-label="计划概览">
@@ -242,9 +256,9 @@ function renderSchedules(records, now) {
       <div class="stat"><dt>占用中</dt><dd>${active}</dd></div>
     </dl>
     <section class="table-panel" aria-labelledby="schedule-heading">
-      <div class="table-heading"><h2 id="schedule-heading">全部账号</h2><span class="zone">所有时间均为 UTC</span></div>
+      <div class="table-heading"><h2 id="schedule-heading">全部账号</h2><span class="zone">北京时间（UTC+8）</span></div>
       <div class="table-scroll" role="region" aria-label="账号计划表，可横向滚动" tabindex="0">
-        <table><thead><tr><th scope="col">账号 ID</th><th scope="col">调度状态</th><th scope="col">上次结果</th><th scope="col">下次检查 (UTC)</th><th scope="col">最近更新 (UTC)</th><th scope="col">占用截止 (UTC)</th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th scope="col">账号</th><th scope="col">调度状态</th><th scope="col">上次结果</th><th scope="col">下次检查（北京时间）</th><th scope="col">最近更新（北京时间）</th><th scope="col">占用截止（北京时间）</th></tr></thead><tbody>${rows}</tbody></table>
       </div>
     </section>
     <footer><p>页面只读。到期的账号会在下一次定时检查时尝试触发；KV 更新可能有短暂延迟。</p><p>“占用中”按调度占用期限判断，不代表 GitHub Actions 的实时状态。未配置的旧账号仅供查看。</p></footer>

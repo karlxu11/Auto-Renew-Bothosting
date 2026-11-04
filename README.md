@@ -108,7 +108,9 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 ```
 
 页面沿用现有的 `AUTH_KEY` 和 `RENEWAL_STATE` KV binding，无需新增变量。
-它会列出当前配置的全部账号，以及 KV 中 `renewal-account:` 前缀下保留的旧账号，显示调度状态、上次结果、下次检查、最近更新和占用截止时间。**所有时间均为 UTC。**
+它会列出当前配置的全部账号，以及 KV 中 `renewal-account:` 前缀下保留的旧账号，显示调度状态、上次结果、下次检查、最近更新和占用截止时间。**所有时间均转换为北京时间（UTC+8）显示。**
+
+页面上的账号名称对应关系：`account_1` → `karlxu28`，`account_2` → `karlxu0`，`account_3` → `karlzhe`。其他账号显示其原始 ID。手动触发时仍使用账号 ID。
 
 - 配置中存在但还没有 KV 记录的账号显示“待初始化”；旧账号显示“未配置”，不参与调度。
 - “占用中”表示调度占用期限尚未结束，不代表 GitHub Actions 的实时状态。
