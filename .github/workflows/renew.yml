@@ -172,9 +172,11 @@ jobs:
             fi
           done
 
-      - name: 📦 上传运行日志
+      - name: 📦 上传运行日志和续期截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: renew-log
-          path: renew.log
+          path: |
+            renew.log
+            renew_result_*.png

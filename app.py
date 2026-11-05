@@ -203,33 +203,34 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
     return "\n".join(lines)
 
 # 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30, require_token=False):
+def wait_for_turnstile_pass(sb, timeout=30, submit_selector=None):
     start = time.monotonic()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.monotonic() - start < timeout:
-        if require_token:
-            # 验证框位于跨域 iframe 中，外层页面没有提示文字不代表验证成功。
-            verified = sb.execute_script(
-                """
-                const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
-                if ([...responses].some(el => (el.value || '').trim())) return true;
-                try {
-                  return Boolean(window.turnstile && window.turnstile.getResponse());
-                } catch (_) {
-                  return false;
-                }
-                """
+        # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
+        verified = sb.execute_script(
+            """
+            const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
+            if ([...responses].some(el => (el.value || '').trim())) return true;
+            try {
+              return Boolean(window.turnstile && window.turnstile.getResponse());
+            } catch (_) {
+              return false;
+            }
+            """
+        )
+        # token 出现和前端解锁按钮可能不同步，两个条件必须同时满足。
+        if verified and (
+            not submit_selector
+            or (
+                sb.is_element_visible(submit_selector)
+                and sb.is_element_enabled(submit_selector)
+                and sb.get_attribute(submit_selector, "aria-disabled", hard_fail=False) != "true"
             )
-            if verified:
-                print("✅ Cloudflare 验证已通过")
-                return True
-        else:
-            page_lower = sb.get_page_source().lower()
-            if not any(x in page_lower for x in cf_indicators):
-                print("ℹ️ 页面上已没有检测到 Cloudflare 验证提示")
-                return True
+        ):
+            print("✅ Cloudflare 验证已通过" + ("，续期按钮已启用" if submit_selector else ""))
+            return True
         sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
+    print("❌ Turnstile 验证超时或提交按钮仍未启用")
     return False
     
 # 获取当前出口ip
@@ -319,7 +320,7 @@ def do_email_password_login(sb, account) -> bool:
             except Exception as e:
                 print(f"⚠️ 点击登录页 Cloudflare 验证框出错: {e}")
 
-            if wait_for_turnstile_pass(sb, timeout=30, require_token=True):
+            if wait_for_turnstile_pass(sb, timeout=30):
                 turnstile_passed = True
                 break
 
@@ -455,6 +456,19 @@ def extract_renewal_countdown(page_text: str):
     return match.group(1) if match else None
 
 
+def wait_for_renewal_countdown(sb, timeout=45):
+    """轮询续期结果，允许代理和页面渲染延迟，不重复提交续期请求。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        countdown = extract_renewal_countdown(sb.get_page_source())
+        if countdown:
+            return countdown
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sb.sleep(min(1, remaining))
+
+
 def open_billings_page(sb) -> bool:
     """重新打开账单页，用于续期失败后的单次重试。"""
     try:
@@ -492,59 +506,68 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
         return {"status": "failed", "error": "未找到续期按钮，页面状态未知"}
 
     print("🔄 点击外部续期按钮，等待验证窗口...")
+    submit_selector = 'button:contains("Renew for 4 days")'
     try:
-        sb.sleep(2)
         sb.click(outer_renew_selector)
-        sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+        sb.wait_for_element_visible(submit_selector, timeout=30)
     except Exception as e:
         print(f"❌ 点击外部按钮失败: {e}")
-        return {"status": "failed", "error": f"点击外部续期按钮出错: {e}"}
+        return {
+            "status": "failed",
+            "error": f"打开续期弹窗失败: {e}",
+            "screenshot": save_renewal_screenshot(sb, attempt_number),
+        }
 
     # 处理弹窗中的 Turnstile
     print("🔒 检测弹窗中的 Turnstile 验证...")
     turnstile_passed = False
     for captcha_attempt in range(1, 4):
+        print(f"🔒 点击续期弹窗 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
         try:
             sb.uc_gui_click_captcha()
-            time.sleep(12)
         except Exception as e:
             print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-        if wait_for_turnstile_pass(sb, timeout=20):
+        if wait_for_turnstile_pass(sb, timeout=30, submit_selector=submit_selector):
             turnstile_passed = True
             break
         print(f"⏳ 第 {captcha_attempt} 次未通过，重试点击...")
 
     if not turnstile_passed:
         print("❌ Turnstile 验证最终未通过")
-        return {"status": "failed", "error": "Turnstile 验证未通过"}
+        return {
+            "status": "failed",
+            "error": "续期弹窗 Turnstile 未通过或续期按钮未启用，未提交续期",
+            "screenshot": save_renewal_screenshot(sb, attempt_number),
+        }
 
     # 点击弹窗中的续期按钮
-    print("⏳ 等待续期按钮可用并点击...")
-    time.sleep(5)
+    print("⏳ 提交续期...")
     try:
-        sb.click('button:contains("Renew for 4 days")', timeout=8)
-        print("✅ 已点击续期按钮")
+        sb.wait_for_element_clickable(submit_selector, timeout=8)
+        sb.click(submit_selector, timeout=8)
+        print("ℹ️ 已点击续期按钮，等待账单倒计时确认结果")
     except Exception as e:
         print(f"❌ 续期按钮点击失败: {e}")
-        return {"status": "failed", "error": f"弹窗续期按钮点击失败: {e}"}
-
-    print("⏳ 等待续期结果 10 秒...")
-    time.sleep(10)
-    renewal_screenshot = save_renewal_screenshot(sb, attempt_number)
+        return {
+            "status": "failed",
+            "error": f"弹窗续期按钮点击失败: {e}",
+            "screenshot": save_renewal_screenshot(sb, attempt_number),
+        }
 
     # 续期成功后会出现新的倒计时；不再读取或比较到期日期。
+    print("⏳ 等待续期倒计时更新（最多 45 秒）...")
     try:
-        new_page_text = sb.get_page_source()
-        new_countdown = extract_renewal_countdown(new_page_text)
+        new_countdown = wait_for_renewal_countdown(sb)
     except Exception as e:
         print(f"❌ 读取续期结果失败: {e}")
         return {
             "status": "failed",
             "error": f"读取续期结果失败: {e}",
-            "screenshot": renewal_screenshot,
+            "screenshot": save_renewal_screenshot(sb, attempt_number),
         }
 
+    renewal_screenshot = save_renewal_screenshot(sb, attempt_number)
     if new_countdown:
         print(f"✅ 续期成功！新的倒计时: {new_countdown}")
         return {
@@ -554,10 +577,12 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
             "screenshot": renewal_screenshot,
         }
 
-    print("⚠️ 续期结果未知，页面未出现新的倒计时")
+    for message in get_login_feedback(sb):
+        print(f"🔎 续期页面提示: {message}")
+    print("⚠️ 等待 45 秒后仍未出现新的续期倒计时")
     return {
         "status": "failed",
-        "error": "续期结果未知，页面未出现新的倒计时",
+        "error": "续期提交后等待 45 秒，页面仍未出现新的倒计时",
         "screenshot": renewal_screenshot,
     }
 
@@ -697,7 +722,6 @@ def main():
         try:
             result = renew_account(account, sb_kwargs, proxy_server, is_proxy) or result
         except Exception as e:
-            failed_accounts += 1
             EMAIL = account["email"]
             BOT_HOSTING_PASSWORD = account["password"]
             _ACCOUNT_NAME = account["name"]
@@ -705,8 +729,12 @@ def main():
             print(f"❌ 账号 {index} 执行异常: {e}")
             send_telegram_message(format_notification("❌ 账号续期异常", error=str(e)))
         report_account_schedule(account, result)
+        if result.get("status") == "failed":
+            failed_accounts += 1
 
-    print(f"🏁 多账号续期处理完成：共处理 {len(accounts)} 个账号，未捕获异常 {failed_accounts} 个")
+    print(f"🏁 多账号续期处理完成：共处理 {len(accounts)} 个账号，失败 {failed_accounts} 个")
+    if failed_accounts:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
