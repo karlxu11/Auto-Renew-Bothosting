@@ -32,6 +32,7 @@ class ProxyFallbackTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(contextlib.redirect_stdout(self.output))
         self.probe = self.stack.enter_context(patch.object(app, "proxy_is_available", return_value=True))
+        self.connection = self.stack.enter_context(patch.object(app, "vpngate_connection_snapshot", return_value=("connected", "node-a", "192.0.2.1", "first-connection")))
         self.session = self.stack.enter_context(patch.object(app, "renew_account_once", return_value={"status": "success"}))
         self.notify = self.stack.enter_context(patch.object(app, "send_saved_failure_notification"))
 
@@ -77,6 +78,26 @@ class ProxyFallbackTests(unittest.TestCase):
         self.assertEqual(self.run_proxy(), result)
         self.assertEqual(self.session.call_count, 1)
         self.notify.assert_called_once_with(self.account, result)
+
+    def test_node_switch_during_verification_retries_even_when_proxy_is_healthy_again(self):
+        self.connection.side_effect = [
+            ("connected", "node-a", "192.0.2.1", "first-connection"),
+            ("connected", "node-b", "192.0.2.2", "second-connection"),
+        ]
+        self.session.side_effect = [{"status": "failed", "network_error": ""}, {"status": "success"}]
+        result = self.run_proxy()
+        self.assertTrue(result["direct_fallback"])
+        self.assert_direct_call()
+        self.notify.assert_not_called()
+
+    def test_reconnect_to_same_node_is_detected_by_connection_time(self):
+        self.connection.side_effect = [
+            ("connected", "node-a", "192.0.2.1", "first-connection"),
+            ("connected", "node-a", "192.0.2.1", "second-connection"),
+        ]
+        self.session.side_effect = [{"status": "failed", "network_error": ""}, {"status": "not_due"}]
+        self.assertTrue(self.run_proxy()["direct_fallback"])
+        self.assert_direct_call()
 
     def test_direct_failure_stops_after_one_fallback(self):
         self.session.side_effect = [
@@ -136,6 +157,21 @@ class ProxyFallbackTests(unittest.TestCase):
 
 
 class ProxyProbeAndPageTests(unittest.TestCase):
+    def test_runner_snapshot_records_node_and_connection_time(self):
+        with patch.object(app.requests, "Session") as factory:
+            session = factory.return_value.__enter__.return_value
+            session.get.return_value.json.return_value = {
+                "state": "connected", "current": {"hostName": "node-a", "ip": "192.0.2.1"}, "connectedAt": "2026-11-05T10:00:00Z",
+            }
+            self.assertEqual(app.vpngate_connection_snapshot(PROXY), ("connected", "node-a", "192.0.2.1", "2026-11-05T10:00:00Z"))
+        self.assertFalse(session.trust_env)
+        self.assertTrue(session.get.call_args.args[0].endswith("/status"))
+
+    def test_external_proxy_does_not_query_the_local_vpngate_runner(self):
+        with patch.object(app.requests, "Session") as factory:
+            self.assertIsNone(app.vpngate_connection_snapshot("socks5://192.0.2.1:1080"))
+        factory.assert_not_called()
+
     def test_probe_checks_login_and_challenge_domains_using_remote_dns(self):
         with patch.object(app.requests, "Session") as factory:
             session = factory.return_value.__enter__.return_value

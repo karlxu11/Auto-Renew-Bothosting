@@ -58,6 +58,24 @@ def proxy_is_available(proxy_server: str) -> bool:
         return False
 
 
+def vpngate_connection_snapshot(proxy_server: str):
+    """记录本地 Runner 的节点和建连时间，识别验证期间曾断线又恢复的会话。"""
+    proxy = urllib.parse.urlparse(proxy_server)
+    if proxy.hostname not in {"127.0.0.1", "localhost"} or proxy.port != 10080:
+        return None
+    control_url = os.environ.get("VPNGATE_CONTROL_URL", "http://127.0.0.1:18081").rstrip("/")
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(f"{control_url}/status", timeout=3)
+            response.raise_for_status()
+            status = response.json()
+        current = status.get("current") or {}
+        return (status.get("state"), current.get("hostName"), current.get("ip"), status.get("connectedAt"))
+    except (requests.RequestException, ValueError, AttributeError):
+        return None
+
+
 def countdown_to_seconds(countdown: str):
     match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})", str(countdown or "").strip())
     if not match:
@@ -763,6 +781,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
 
     use_direct = not proxy_is_available(proxy_server)
     if not use_direct:
+        connection_before = vpngate_connection_snapshot(proxy_server)
         try:
             result = renew_account_once(account, sb_kwargs, proxy_server, True, defer_failures=True)
         except Exception as exc:
@@ -773,7 +792,11 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
         else:
             if result.get("status") != "failed":
                 return result
-            use_direct = bool(result.get("network_error")) or not proxy_is_available(proxy_server)
+            connection_after = vpngate_connection_snapshot(proxy_server)
+            connection_changed = bool(connection_before and connection_after and connection_before != connection_after)
+            if connection_changed:
+                print("⚠️ 验证期间 VPNGate 节点或建连时间已变化，原浏览器会话需要重建。", flush=True)
+            use_direct = connection_changed or bool(result.get("network_error")) or not proxy_is_available(proxy_server)
             if not use_direct:
                 send_saved_failure_notification(account, result)
                 return result

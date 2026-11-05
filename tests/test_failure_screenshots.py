@@ -232,7 +232,7 @@ class FailureScreenshotTests(unittest.TestCase):
 
         app.SB.side_effect = launch
         self.login.side_effect = [False, True]
-        with patch.object(app, "proxy_is_available", return_value=True):
+        with patch.object(app, "proxy_is_available", return_value=True), patch.object(app, "vpngate_connection_snapshot", return_value=None):
             result = app.renew_account(self.account, {"uc": True, "proxy": "socks5://127.0.0.1:10080"}, "socks5://127.0.0.1:10080", True)
         self.assertEqual(result["status"], "not_due")
         self.assertTrue(result["direct_fallback"])
