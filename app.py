@@ -24,6 +24,38 @@ if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
 # 记录本次登录方式（用于通知）
 _LOGIN_METHOD = "Email + Password"
 _ACCOUNT_NAME = ""
+NETWORK_ERROR_CODES = (
+    "ERR_SOCKS_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_TIMED_OUT",
+    "ERR_NAME_NOT_RESOLVED", "ERR_NETWORK_CHANGED", "ERR_INTERNET_DISCONNECTED",
+    "ERR_CONNECTION_REFUSED", "ERR_TIMED_OUT",
+)
+
+
+def browser_network_error(sb) -> str:
+    """只读取可见错误代码，识别 Chrome 网络错误页。"""
+    try:
+        text = sb.execute_script("return (document.body && document.body.innerText) || '';")
+        if isinstance(text, str):
+            return next((code for code in NETWORK_ERROR_CODES if code in text), "")
+    except Exception:
+        pass
+    return ""
+
+
+def proxy_is_available(proxy_server: str) -> bool:
+    """复核登录站点和验证域名的代理通路；HTTP 403 也表示网络已连通。"""
+    proxy_url = proxy_server.replace("socks5://", "socks5h://", 1)
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            for url in ("https://bot-hosting.net/login", "https://challenges.cloudflare.com/"):
+                with session.get(url, proxies={"http": proxy_url, "https": proxy_url}, timeout=8, stream=True, allow_redirects=False):
+                    pass
+        return True
+    except requests.RequestException as exc:
+        print(f"⚠️ 代理连通性复核失败: {exc}", flush=True)
+        return False
 
 
 def countdown_to_seconds(countdown: str):
@@ -169,23 +201,37 @@ def save_login_step_screenshot(sb, account, step: str) -> str:
     return save_redacted_screenshot(sb, f"login_{account_id}_{step_id}.png")
 
 
-def notify_account_failure(sb, account, step: str, error: str, extra: str = "") -> dict:
-    """在浏览器关闭前截取当前失败页面，并随失败通知发送。"""
-    step_label = {"login": "登录", "billings": "打开账单页", "renewal": "续期"}.get(step, step)
+def notify_account_failure(sb, account, step: str, error: str, extra: str = "", notify: bool = True) -> dict:
+    """在浏览器关闭前留存现场；代理恢复期间将通知延后到最终结果。"""
+    network_error = browser_network_error(sb) or next((code for code in NETWORK_ERROR_CODES if code in error), "")
+    if network_error:
+        error = f"页面网络错误 {network_error}；{error}"
     account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
     step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
     # 使用唯一文件名，防止截图失败时误用之前的步骤或其他账号的旧图。
     screenshot_path = save_redacted_screenshot(sb, f"failure_{account_id}_{step_id}_{uuid4().hex}.png")
+    result = {
+        "status": "failed", "error": error, "screenshot": screenshot_path, "failure_step": step,
+        "failure_extra": extra, "network_error": network_error,
+    }
+    if notify:
+        send_saved_failure_notification(account, result)
+    return result
+
+
+def send_saved_failure_notification(account, result):
+    step = result.get("failure_step", "账号执行")
+    step_label = {"login": "登录", "billings": "打开账单页", "renewal": "续期"}.get(step, step)
+    screenshot_path = result.get("screenshot", "")
     detail = f"👤 账号映射: {format_account_label(account['id'])}\n失败步骤: {step_label}"
-    if extra:
-        detail += f"\n{extra}"
+    if result.get("failure_extra"):
+        detail += f"\n{result['failure_extra']}"
     if not screenshot_path:
         detail += "\n当前页面无法截图，已发送文字说明。"
     send_telegram_message(
-        format_notification(f"❌ {step_label}失败", extra=detail, error=error),
+        format_notification(f"❌ {step_label}失败", extra=detail, error=result.get("error", "未知错误")),
         screenshot_path=screenshot_path,
     )
-    return {"status": "failed", "error": error, "screenshot": screenshot_path, "failure_step": step}
 
 
 def save_renewal_screenshot(sb, attempt_number: int) -> str:
@@ -233,6 +279,10 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
 def wait_for_turnstile_pass(sb, timeout=30, submit_selector=None):
     start = time.monotonic()
     while time.monotonic() - start < timeout:
+        network_error = browser_network_error(sb)
+        if network_error:
+            print(f"❌ 验证页面网络连接失败: {network_error}")
+            return False
         # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
         verified = sb.execute_script(
             """
@@ -294,6 +344,10 @@ def do_email_password_login(sb, account) -> bool:
         sb.wait_for_ready_state_complete()
         sb.sleep(2)
         save_login_step_screenshot(sb, account, "01_login_page")
+        network_error = browser_network_error(sb)
+        if network_error:
+            print(f"❌ 登录页面未加载: {network_error}")
+            return False
 
         email_selectors = [
             'input[type="email"]',
@@ -349,6 +403,8 @@ def do_email_password_login(sb, account) -> bool:
 
             if wait_for_turnstile_pass(sb, timeout=30):
                 turnstile_passed = True
+                break
+            if browser_network_error(sb):
                 break
 
         if not turnstile_passed:
@@ -638,8 +694,8 @@ def renew_with_retry(sb):
     return retry_result
 
 
-# 为一个账号完成登录和续期；每个账号使用独立浏览器会话。
-def renew_account(account, sb_kwargs, proxy_server, is_proxy):
+# 为一个账号执行一次浏览器会话。
+def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failures=False):
     global EMAIL, BOT_HOSTING_PASSWORD
     global _LOGIN_METHOD, _ACCOUNT_NAME
 
@@ -659,12 +715,13 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
 
             if not (EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb, account)):
                 return notify_account_failure(
-                    sb, account, step, "登录页验证或邮箱密码登录未完成，详情见日志和失败截图"
+                    sb, account, step, "登录页验证或邮箱密码登录未完成，详情见日志和失败截图",
+                    notify=not defer_failures,
                 )
 
             step = "billings"
             if not open_billings_page(sb):
-                return notify_account_failure(sb, account, step, "邮箱登录后未能打开账单页")
+                return notify_account_failure(sb, account, step, "邮箱登录后未能打开账单页", notify=not defer_failures)
             print("✅ 邮箱和密码登录成功，当前已到达账单页")
             print("ℹ️ 本次使用邮箱和密码登录")
 
@@ -677,6 +734,7 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
                 return notify_account_failure(
                     sb, account, step, error_msg,
                     extra="已自动重跑 1 次；截图为本次最后失败页面。",
+                    notify=not defer_failures,
                 )
 
             if renewal_result["status"] == "success":
@@ -695,7 +753,37 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
             return renewal_result
         except Exception as e:
             print(f"❌ 账号 {format_account_label(account['id'])} 执行异常: {e}")
-            return notify_account_failure(sb, account, step, f"执行异常: {e}")
+            return notify_account_failure(sb, account, step, f"执行异常: {e}", notify=not defer_failures)
+
+
+def renew_account(account, sb_kwargs, proxy_server, is_proxy):
+    """代理启动后再次检查；运行中失效时，用全新直连会话最多重跑一次。"""
+    if not is_proxy:
+        return renew_account_once(account, sb_kwargs, proxy_server, False)
+
+    use_direct = not proxy_is_available(proxy_server)
+    if not use_direct:
+        try:
+            result = renew_account_once(account, sb_kwargs, proxy_server, True, defer_failures=True)
+        except Exception as exc:
+            if not any(code in str(exc) for code in NETWORK_ERROR_CODES) and proxy_is_available(proxy_server):
+                raise
+            print(f"⚠️ 代理浏览器启动或连接异常: {exc}", flush=True)
+            use_direct = True
+        else:
+            if result.get("status") != "failed":
+                return result
+            use_direct = bool(result.get("network_error")) or not proxy_is_available(proxy_server)
+            if not use_direct:
+                send_saved_failure_notification(account, result)
+                return result
+
+    print(f"⚠️ {format_account_label(account['id'])} 的代理不可用，将用全新浏览器直连重试一次。", flush=True)
+    direct_kwargs = dict(sb_kwargs)
+    direct_kwargs.pop("proxy", None)
+    result = renew_account_once(account, direct_kwargs, "", False)
+    result["direct_fallback"] = True
+    return result
 
 
 # 主流程
@@ -752,6 +840,11 @@ def main():
             _LOGIN_METHOD = "Email + Password"
             print(f"❌ 账号 {index} 执行异常: {e}")
             send_telegram_message(format_notification("❌ 账号续期异常", error=str(e)))
+        if result.get("direct_fallback"):
+            is_proxy = False
+            proxy_server = ""
+            sb_kwargs.pop("proxy", None)
+            print("🌐 本次运行后续账号也将使用直连。", flush=True)
         report_account_schedule(account, result)
         if result.get("status") == "failed":
             failed_accounts += 1

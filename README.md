@@ -57,6 +57,7 @@ GitHub Actions Secrets 中还需添加 `SCHEDULER_URL`（Worker 的完整 URL）
 - 未完成握手就退出的节点（包括 `AUTH_FAILED` 后以退出码 0 结束）也会隔离，避免反复连接同一个坏节点；
 - 最多等待连接 300 秒，确认 SOCKS5 能访问目标站后才启用代理；
 - VPNGate 下载、构建、启动或连接失败时，自动使用 GitHub Actions runner 直连，继续执行登录、续期和调度回写；
+- 每个账号启动浏览器前会复核登录站点与验证域名的代理通路；运行中出现 Chrome 网络错误页或代理探测失败时，关闭原浏览器并用全新直连会话最多重跑 1 次，后续账号也使用直连；
 - 不再使用 `NODE_LINK` 或远程 sing-box 脚本。
 
 筛选条件可在 `.github/workflows/renew.yml` 的“启动 VPNGate SOCKS5 代理”步骤中修改：
@@ -122,6 +123,7 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 * 必填变量必须要填写
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
 * VPNGate 不可用时仍会直连尝试续期；直连出口同样可能受到目标站的 Cloudflare 限制
+* 代理失效时会先保留脱敏现场截图，再尝试直连恢复；Telegram 只通知本次最终结果，直连也失败时发送最后失败页面，所有失败现场仍保存在 `renew-log` artifact
 * 邮箱密码填写完成后等待 10 秒，再点击 Cloudflare 验证复选框；最多尝试 3 次，确认验证通过后才点击 Sign in，未通过时本次登录会失败
 * 登录中间步骤截图仅保存在运行环境本地；登录、打开账单页、续期最终失败或浏览器内执行异常时，会在关闭浏览器前截取最后页面并发送到 Telegram，截图时遮住凭据输入框；无法截图时发送文字说明
 * 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试

@@ -40,6 +40,8 @@ class Browser:
         if self.closed:
             raise RuntimeError("browser already closed")
         self.scripts.append(script)
+        if "document.body.innerText" in script:
+            return self.page
         if "setProperty" in script:
             self.events.append("mask")
             if self.redaction_error:
@@ -214,6 +216,32 @@ class FailureScreenshotTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertTrue(Path(result["screenshot"]).is_file())
         self.assertEqual(self.sent, [])
+
+    def test_proxy_failure_closes_the_old_browser_before_direct_retry_and_notifies_only_final_result(self):
+        first = self.browser
+        first.page = "This site can't be reached ERR_SOCKS_CONNECTION_FAILED"
+        second = Browser(self.events)
+        launches = []
+
+        def launch(**kwargs):
+            launches.append(kwargs)
+            if len(launches) == 1:
+                return first
+            self.assertTrue(first.closed)
+            return second
+
+        app.SB.side_effect = launch
+        self.login.side_effect = [False, True]
+        with patch.object(app, "proxy_is_available", return_value=True):
+            result = app.renew_account(self.account, {"uc": True, "proxy": "socks5://127.0.0.1:10080"}, "socks5://127.0.0.1:10080", True)
+        self.assertEqual(result["status"], "not_due")
+        self.assertTrue(result["direct_fallback"])
+        self.assertIn("proxy", launches[0])
+        self.assertNotIn("proxy", launches[1])
+        self.assertTrue(second.closed)
+        self.assertEqual([item["type"] for item in self.sent], ["text"])
+        self.assertIn("未到续期时间", self.sent[0]["text"])
+        self.assertEqual(len(list(Path.cwd().glob("failure_account_3_login_*.png"))), 1)
 
 
 if __name__ == "__main__":
