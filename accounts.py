@@ -8,6 +8,16 @@ import sys
 
 
 ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ACCOUNT_DISPLAY_NAMES = {
+    "account_1": "karlxu28",
+    "account_2": "karlxu0",
+    "account_3": "karlzhe",
+}
+
+
+def format_account_label(account_id):
+    name = ACCOUNT_DISPLAY_NAMES.get(account_id)
+    return f"{account_id}（{name}）" if name else account_id
 
 
 def load_accounts():
@@ -85,7 +95,7 @@ def main():
         return 1
 
     ids = [account["id"] for account in accounts]
-    label = ", ".join(ids) or "无账号"
+    label = ", ".join(format_account_label(account_id) for account_id in ids) or "无账号"
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
     print(f"🧾 本次续期账号（{len(ids)} 个）：{label}", flush=True)
     print(f"🔁 第 {attempt} 次运行；Re-run jobs 沿用原来的账号选择。", flush=True)
@@ -100,7 +110,10 @@ def main():
         with Path(summary_path).open("a", encoding="utf-8") as summary:
             summary.write("### 本次续期账号\n\n")
             summary.write(f"账号数量：{len(ids)}；运行次数：{attempt}\n\n")
-            summary.write("\n".join(f"- `{account_id}`" for account_id in ids) or "无账号，无需续期。")
+            summary.write("\n".join(
+                f"- `{account_id}`" + (f" → {ACCOUNT_DISPLAY_NAMES[account_id]}" if account_id in ACCOUNT_DISPLAY_NAMES else "")
+                for account_id in ids
+            ) or "无账号，无需续期。")
             summary.write("\n\nRe-run jobs 沿用原来的账号选择。更换账号请使用 Run workflow，并填写 account_ids。\n")
     return 0
 

@@ -5,7 +5,7 @@ import os, re, sys, time, json, requests, html
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
-from accounts import load_accounts, select_accounts
+from accounts import format_account_label, load_accounts, select_accounts
 
 # 通过 GitHub Actions Secrets 等环境变量配置账号信息，不要写入源码。
 EMAIL         = os.environ.get("EMAIL") or ""           # Bot-hosting 登录邮箱，也用于通知
@@ -702,7 +702,7 @@ def main():
         print("ℹ️ 本次没有选中的账号，无需处理。")
         return
 
-    print(f"🧾 本次选中账号 ID: {', '.join(account['id'] for account in accounts)}")
+    print(f"🧾 本次选中账号: {', '.join(format_account_label(account['id']) for account in accounts)}")
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
@@ -717,7 +717,7 @@ def main():
 
     failed_accounts = 0
     for index, account in enumerate(accounts, start=1):
-        print(f"\n========== 开始续期账号 {index}/{len(accounts)} · {account['id']} ==========")
+        print(f"\n========== 开始续期账号 {index}/{len(accounts)} · {format_account_label(account['id'])} ==========")
         result = {"status": "failed"}
         try:
             result = renew_account(account, sb_kwargs, proxy_server, is_proxy) or result

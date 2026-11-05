@@ -98,25 +98,43 @@ class AccountSelectionTests(unittest.TestCase):
             self.assertIn("未知账号 ID", result.stderr)
             self.assertFalse(env_file.exists())
 
+    def test_preflight_displays_mappings_and_exports_only_selected_ids(self):
+        ids = ["account_3", "account_1", "account_2"]
+        config = [{**CONFIG[0], "id": account_id} for account_id in ids]
+        with tempfile.TemporaryDirectory() as folder:
+            env_file = Path(folder) / "env"
+            summary_file = Path(folder) / "summary"
+            environment = dict(os.environ, BOT_HOSTING_ACCOUNTS=json.dumps(config), SELECTED_ACCOUNT_IDS=",".join(ids), GITHUB_ENV=str(env_file), GITHUB_STEP_SUMMARY=str(summary_file))
+            result = subprocess.run([sys.executable, str(ROOT / "accounts.py")], env=environment, capture_output=True, text=True, check=True)
+            self.assertEqual(env_file.read_text(), f"SELECTED_ACCOUNT_IDS={json.dumps(ids)}\n")
+            summary = summary_file.read_text()
+            for account_id, name in [("account_1", "karlxu28"), ("account_2", "karlxu0"), ("account_3", "karlzhe")]:
+                self.assertIn(f"{account_id}（{name}）", result.stdout)
+                self.assertIn(f"`{account_id}` → {name}", summary)
+            self.assertLess(summary.index("karlzhe"), summary.index("karlxu28"))
+            self.assertLess(summary.index("karlxu28"), summary.index("karlxu0"))
+
     def test_renewal_app_processes_only_the_exported_account(self):
         spec = importlib.util.spec_from_file_location("renewal_app_for_test", ROOT / "app.py")
         app = importlib.util.module_from_spec(spec)
         environment = {
-            "SELECTED_ACCOUNT_IDS": '["custom-id"]',
+            "SELECTED_ACCOUNT_IDS": '["account_1"]',
             "SCHEDULER_URL": "https://scheduler.example.invalid",
             "SCHEDULER_AUTH_KEY": "test-scheduler-key",
             "IS_PROXY": "false",
         }
+        output = io.StringIO()
         with patch.dict(os.environ, environment), patch.dict(sys.modules, {"seleniumbase": SimpleNamespace(SB=None)}):
             spec.loader.exec_module(app)
             with patch.object(app, "renew_account", return_value={"status": "not_due"}) as renew, patch.object(
                 app, "report_account_schedule"
-            ) as report, contextlib.redirect_stdout(io.StringIO()):
+            ) as report, contextlib.redirect_stdout(output):
                 app.main()
         self.assertEqual(renew.call_count, 1)
-        self.assertEqual(renew.call_args.args[0]["id"], "custom-id")
+        self.assertEqual(renew.call_args.args[0]["id"], "account_1")
         self.assertFalse(renew.call_args.args[3])
-        self.assertEqual(report.call_args.args[0]["id"], "custom-id")
+        self.assertEqual(report.call_args.args[0]["id"], "account_1")
+        self.assertIn("account_1（karlxu28）", output.getvalue())
 
 
 if __name__ == "__main__":

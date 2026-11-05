@@ -12,7 +12,8 @@ on:
   workflow_dispatch:
     inputs:
       account_ids:
-        description: '续期账号 ID，多个用逗号分隔（如 account_1,account_2）；留空处理全部账号'
+        description: >-
+          续期账号 ID：account_1=karlxu28；account_2=karlxu0；account_3=karlzhe。多个 ID 用逗号分隔，留空处理全部账号。
         required: false
         default: ''
         type: string
