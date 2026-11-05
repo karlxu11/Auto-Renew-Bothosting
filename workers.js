@@ -184,7 +184,7 @@ function renderSchedules(records, now) {
       resultLabel = "未知结果";
     }
     return `<tr data-account-id="${escapeHtml(record.id)}">
-      <td><strong class="account">${escapeHtml(name)}</strong>${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
+      <td><strong class="account">${escapeHtml(name)}</strong>${name !== record.id ? `<span class="subtext">${escapeHtml(record.id)}</span>` : ""}${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
       <td><span class="badge ${status.kind}">${status.label}</span></td>
       <td>${escapeHtml(resultLabel)}</td>
       <td>${renderBeijingTime(record.state?.next_run_at)}</td>

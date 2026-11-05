@@ -58,6 +58,9 @@ test("lists configured accounts, historical KV accounts, and missing records wit
   assert.match(rowFor(html, "account_1"), />karlxu28<\/strong>/);
   assert.match(rowFor(html, "account_2"), />karlxu0<\/strong>/);
   assert.match(rowFor(html, "account_3"), />karlzhe<\/strong>/);
+  for (const id of ["account_1", "account_2", "account_3"]) {
+    assert.ok(rowFor(html, id).includes(`<span class="subtext">${id}</span>`));
+  }
   assert.match(rowFor(html, "account_1"), /等待中/);
   assert.match(rowFor(html, "account_2"), /待初始化/);
   assert.match(rowFor(html, "account_3"), /待初始化/);
