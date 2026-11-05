@@ -4,6 +4,7 @@
 import os, re, sys, time, json, requests, html
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from seleniumbase import SB
 from accounts import format_account_label, load_accounts, select_accounts
 
@@ -103,14 +104,14 @@ def send_telegram_message(message: str, screenshot_path: str = ""):
                     )
 
                 if response.ok:
-                    print(f"✅ Telegram 通知和续期截图已发送: {screenshot_path}")
+                    print(f"✅ Telegram 通知和截图已发送: {screenshot_path}")
                     return
 
                 print(f"⚠️ Telegram 截图发送失败（HTTP {response.status_code}），改发文字通知")
             except Exception as e:
                 print(f"⚠️ Telegram 截图发送异常，改发文字通知: {e}")
         elif screenshot_path:
-            print(f"⚠️ 续期截图不存在，改发文字通知: {screenshot_path}")
+            print(f"⚠️ 截图不存在，改发文字通知: {screenshot_path}")
 
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         response = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
@@ -120,11 +121,8 @@ def send_telegram_message(message: str, screenshot_path: str = ""):
         print(f"❌ Telegram 发送失败: {e}")
 
 
-def save_login_step_screenshot(sb, account, step: str):
-    """仅在本地保存登录步骤截图；截图时遮住输入框内容。"""
-    account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
-    step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
-    screenshot_path = f"login_{account_id}_{step_id}.png"
+def save_redacted_screenshot(sb, screenshot_path: str) -> str:
+    """隐藏凭据输入框后截图；脱敏失败时跳过截图，最后恢复页面样式。"""
     try:
         sb.execute_script(
             """
@@ -140,9 +138,12 @@ def save_login_step_screenshot(sb, account, step: str):
             """
         )
         sb.save_screenshot(screenshot_path)
+        if os.path.isfile(screenshot_path):
+            print(f"📸 脱敏截图已保存: {screenshot_path}")
+            return screenshot_path
+        print(f"⚠️ 截图未生成: {screenshot_path}")
     except Exception as e:
-        print(f"⚠️ 登录步骤截图失败（{step}）: {e}")
-        return
+        print(f"⚠️ 保存脱敏截图失败: {e}")
     finally:
         try:
             sb.execute_script(
@@ -158,7 +159,33 @@ def save_login_step_screenshot(sb, account, step: str):
         except Exception:
             pass
 
-    print(f"📸 登录步骤截图已保存: {screenshot_path}")
+    return ""
+
+
+def save_login_step_screenshot(sb, account, step: str) -> str:
+    """仅在本地保存登录中间步骤的脱敏截图。"""
+    account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
+    step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
+    return save_redacted_screenshot(sb, f"login_{account_id}_{step_id}.png")
+
+
+def notify_account_failure(sb, account, step: str, error: str, extra: str = "") -> dict:
+    """在浏览器关闭前截取当前失败页面，并随失败通知发送。"""
+    step_label = {"login": "登录", "billings": "打开账单页", "renewal": "续期"}.get(step, step)
+    account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
+    step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
+    # 使用唯一文件名，防止截图失败时误用之前的步骤或其他账号的旧图。
+    screenshot_path = save_redacted_screenshot(sb, f"failure_{account_id}_{step_id}_{uuid4().hex}.png")
+    detail = f"👤 账号映射: {format_account_label(account['id'])}\n失败步骤: {step_label}"
+    if extra:
+        detail += f"\n{extra}"
+    if not screenshot_path:
+        detail += "\n当前页面无法截图，已发送文字说明。"
+    send_telegram_message(
+        format_notification(f"❌ {step_label}失败", extra=detail, error=error),
+        screenshot_path=screenshot_path,
+    )
+    return {"status": "failed", "error": error, "screenshot": screenshot_path, "failure_step": step}
 
 
 def save_renewal_screenshot(sb, attempt_number: int) -> str:
@@ -622,56 +649,53 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
     _LOGIN_METHOD = "Email + Password"
 
     with SB(**sb_kwargs) as sb:
+        step = "login"
         try:
-            ip = get_current_ip(proxy_server if is_proxy else "")
-            print(f"📍 当前出口IP: {ip}")
+            try:
+                ip = get_current_ip(proxy_server if is_proxy else "")
+                print(f"📍 当前出口IP: {ip}")
+            except Exception as e:
+                print(f"⚠️ 获取出口 IP 失败: {e}")
+
+            if not (EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb, account)):
+                return notify_account_failure(
+                    sb, account, step, "登录页验证或邮箱密码登录未完成，详情见日志和失败截图"
+                )
+
+            step = "billings"
+            if not open_billings_page(sb):
+                return notify_account_failure(sb, account, step, "邮箱登录后未能打开账单页")
+            print("✅ 邮箱和密码登录成功，当前已到达账单页")
+            print("ℹ️ 本次使用邮箱和密码登录")
+
+            step = "renewal"
+            # 明确失败或结果未知时，重新打开账单页后最多再跑一次。
+            renewal_result = renew_with_retry(sb)
+            if renewal_result["status"] not in {"success", "not_due"}:
+                error_msg = renewal_result.get("error", "未知错误")
+                print(f"❌ 重跑后续期仍失败: {error_msg}")
+                return notify_account_failure(
+                    sb, account, step, error_msg,
+                    extra="已自动重跑 1 次；截图为本次最后失败页面。",
+                )
+
+            if renewal_result["status"] == "success":
+                send_telegram_message(
+                    format_notification("✅ 续期成功", extra=renewal_result.get("extra", "续期已生效")),
+                    screenshot_path=renewal_result.get("screenshot", ""),
+                )
+            elif renewal_result["status"] == "not_due":
+                print(f"⏳ 未到续期时间: {renewal_result['extra']}")
+                send_telegram_message(
+                    format_notification("⏳ 未到续期时间", extra=renewal_result["extra"]),
+                    screenshot_path=renewal_result.get("screenshot", ""),
+                )
+
+            print(f"✅ 账号 {account['name']} 的续期流程完成")
+            return renewal_result
         except Exception as e:
-            print(f"⚠️ 获取出口 IP 失败: {e}")
-
-        login_ok = False
-
-        if EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb, account):
-            if open_billings_page(sb):
-                login_ok = True
-                print("✅ 邮箱和密码登录成功，当前已到达账单页")
-            else:
-                print("❌ 邮箱登录后未能打开账单页")
-
-        if not login_ok:
-            send_telegram_message(format_notification("❌ 登录失败", error="邮箱密码登录失败"))
-            return {"status": "failed", "error": "邮箱密码登录失败"}
-
-        print("ℹ️ 本次使用邮箱和密码登录")
-
-        # 执行续期；明确失败或结果未知时，重新打开账单页后最多再跑一次。
-        renewal_result = renew_with_retry(sb)
-
-        if renewal_result["status"] == "success":
-            success_extra = renewal_result.get("extra", "续期已生效")
-            send_telegram_message(
-                format_notification("✅ 续期成功", extra=success_extra),
-                screenshot_path=renewal_result.get("screenshot", ""),
-            )
-        elif renewal_result["status"] == "not_due":
-            print(f"⏳ 未到续期时间: {renewal_result['extra']}")
-            send_telegram_message(
-                format_notification("⏳ 未到续期时间", extra=renewal_result["extra"]),
-                screenshot_path=renewal_result.get("screenshot", ""),
-            )
-        else:
-            error_msg = renewal_result.get("error", "未知错误")
-            print(f"❌ 重跑后续期仍失败: {error_msg}")
-            send_telegram_message(
-                format_notification(
-                    "❌ 续期失败",
-                    extra="已自动重跑 1 次，请稍后手动检查",
-                    error=error_msg,
-                ),
-                screenshot_path=renewal_result.get("screenshot", ""),
-            )
-
-    print(f"✅ 账号 {account['name']} 的续期流程完成")
-    return renewal_result
+            print(f"❌ 账号 {format_account_label(account['id'])} 执行异常: {e}")
+            return notify_account_failure(sb, account, step, f"执行异常: {e}")
 
 
 # 主流程

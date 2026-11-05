@@ -181,3 +181,4 @@ jobs:
           path: |
             renew.log
             renew_result_*.png
+            failure_*.png
