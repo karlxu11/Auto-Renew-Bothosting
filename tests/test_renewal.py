@@ -35,11 +35,12 @@ class FakeClock:
 class BillingPage:
     """Model an iframe challenge invisible to the outer HTML and a disabled no-op button."""
 
-    def __init__(self, clock, token_after=0, enabled_after=0, result_after=0):
+    def __init__(self, clock, token_after=0, enabled_after=0, result_after=0, verification_delay=None):
         self.clock = clock
         self.token_after = token_after
         self.enabled_after = enabled_after
         self.result_after = result_after
+        self.verification_delay = verification_delay
         self.aria_disabled = False
         self.submitted_at = None
         self.clicks = []
@@ -82,6 +83,9 @@ class BillingPage:
 
     def uc_gui_click_captcha(self):
         self.captcha_clicks += 1
+        if self.verification_delay is not None:
+            # 重复点击会重启验证，用于模拟长时间停留在 Verifying 的组件。
+            self.token_after = self.enabled_after = self.clock.now + self.verification_delay
 
     def click(self, selector, **kwargs):
         self.clicks.append(selector)
@@ -131,10 +135,34 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(page.clicks.count(SUBMIT), 1)
 
     def test_verification_can_succeed_on_a_later_checkbox_attempt(self):
-        page = BillingPage(self.clock, token_after=35, enabled_after=35)
+        page = BillingPage(self.clock, token_after=75, enabled_after=75)
         self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
         self.assertEqual(page.captcha_clicks, 2)
         self.assertEqual(page.clicks.count(SUBMIT), 1)
+
+    def test_slow_verification_is_not_restarted_before_it_completes(self):
+        page = BillingPage(
+            self.clock, token_after=float("inf"), enabled_after=float("inf"), verification_delay=50,
+        )
+        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
+        self.assertEqual(page.captcha_clicks, 1)
+        self.assertEqual(page.clicks.count(SUBMIT), 1)
+
+    def test_automatically_verified_popup_does_not_click_the_challenge_again(self):
+        page = BillingPage(self.clock, token_after=3, enabled_after=4)
+        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
+        self.assertEqual(page.captcha_clicks, 0)
+        self.assertEqual(page.clicks.count(SUBMIT), 1)
+
+    def test_verification_during_retry_pause_avoids_a_second_checkbox_click(self):
+        page = BillingPage(self.clock, token_after=68, enabled_after=68)
+        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
+        self.assertEqual(page.captcha_clicks, 1)
+        self.assertEqual(page.clicks.count(SUBMIT), 1)
+
+    def test_verification_is_checked_at_the_timeout_boundary(self):
+        page = BillingPage(self.clock, token_after=3, enabled_after=3)
+        self.assertTrue(app.wait_for_turnstile_pass(page, timeout=3, submit_selector=SUBMIT))
 
     def test_click_without_confirmed_result_is_not_success(self):
         page = BillingPage(self.clock, result_after=float("inf"))
@@ -142,7 +170,7 @@ class RenewalTests(unittest.TestCase):
         result = app.attempt_renewal(page, 1)
         self.assertEqual(result["status"], "failed")
         self.assertIn("45 秒", result["error"])
-        self.assertEqual(self.clock.now, 45)
+        self.assertEqual(self.clock.now - page.submitted_at, 45)
         self.assertEqual(page.clicks.count(SUBMIT), 1)
         self.assertIn("Verification expired", self.output.getvalue())
 

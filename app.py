@@ -293,38 +293,46 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
+def turnstile_is_ready(sb, submit_selector=None):
+    """读取验证结果，避免再次点击已经通过的验证框。"""
+    # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
+    verified = sb.execute_script(
+        """
+        const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
+        if ([...responses].some(el => (el.value || '').trim())) return true;
+        try {
+          return Boolean(window.turnstile && window.turnstile.getResponse());
+        } catch (_) {
+          return false;
+        }
+        """
+    )
+    # token 出现和前端解锁按钮可能不同步，两个条件必须同时满足。
+    return bool(verified and (
+        not submit_selector
+        or (
+            sb.is_element_visible(submit_selector)
+            and sb.is_element_enabled(submit_selector)
+            and sb.get_attribute(submit_selector, "aria-disabled", hard_fail=False) != "true"
+        )
+    ))
+
+
 # 等待Turnstile验证通过
 def wait_for_turnstile_pass(sb, timeout=30, submit_selector=None):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
+    deadline = time.monotonic() + timeout
+    while True:
         network_error = browser_network_error(sb)
         if network_error:
             print(f"❌ 验证页面网络连接失败: {network_error}")
             return False
-        # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
-        verified = sb.execute_script(
-            """
-            const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
-            if ([...responses].some(el => (el.value || '').trim())) return true;
-            try {
-              return Boolean(window.turnstile && window.turnstile.getResponse());
-            } catch (_) {
-              return false;
-            }
-            """
-        )
-        # token 出现和前端解锁按钮可能不同步，两个条件必须同时满足。
-        if verified and (
-            not submit_selector
-            or (
-                sb.is_element_visible(submit_selector)
-                and sb.is_element_enabled(submit_selector)
-                and sb.get_attribute(submit_selector, "aria-disabled", hard_fail=False) != "true"
-            )
-        ):
+        if turnstile_is_ready(sb, submit_selector):
             print("✅ Cloudflare 验证已通过" + ("，续期按钮已启用" if submit_selector else ""))
             return True
-        sb.sleep(1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sb.sleep(min(1, remaining))
     print("❌ Turnstile 验证超时或提交按钮仍未启用")
     return False
     
@@ -611,6 +619,9 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
     try:
         sb.click(outer_renew_selector)
         sb.wait_for_element_visible(submit_selector, timeout=30)
+        # 按钮通常先于跨域验证框出现，留出渲染和自动验证的时间。
+        print("⏳ 续期弹窗已打开，等待 5 秒让验证组件加载...")
+        sb.sleep(5)
     except Exception as e:
         print(f"❌ 点击外部按钮失败: {e}")
         return {
@@ -623,16 +634,25 @@ def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
     print("🔒 检测弹窗中的 Turnstile 验证...")
     turnstile_passed = False
     for captcha_attempt in range(1, 4):
+        if turnstile_is_ready(sb, submit_selector):
+            print("✅ Cloudflare 验证已通过，续期按钮已启用，无需再次点击验证框")
+            turnstile_passed = True
+            break
         print(f"🔒 点击续期弹窗 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
         try:
             sb.uc_gui_click_captcha()
         except Exception as e:
             print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-        if wait_for_turnstile_pass(sb, timeout=30, submit_selector=submit_selector):
+        print("⏳ 等待验证完成及续期按钮启用（最多 60 秒）...")
+        if wait_for_turnstile_pass(sb, timeout=60, submit_selector=submit_selector):
             turnstile_passed = True
             break
-        print(f"⏳ 第 {captcha_attempt} 次未通过，重试点击...")
+        if browser_network_error(sb):
+            break
+        if captcha_attempt < 3:
+            print(f"⏳ 第 {captcha_attempt} 次未通过，等待 5 秒后复查，再决定是否重试点击...")
+            sb.sleep(5)
 
     if not turnstile_passed:
         print("❌ Turnstile 验证最终未通过")
