@@ -191,7 +191,7 @@ class ProxyProbeAndPageTests(unittest.TestCase):
 
     def test_chrome_error_page_does_not_wait_for_a_missing_login_form(self):
         page = Mock()
-        page.execute_script.return_value = "This site can't be reached ERR_SOCKS_CONNECTION_FAILED"
+        page.evaluate.return_value = "This site can't be reached ERR_SOCKS_CONNECTION_FAILED"
         with patch.object(app, "save_login_step_screenshot"), contextlib.redirect_stdout(io.StringIO()):
             self.assertFalse(app.do_email_password_login(page, {"id": "account_3"}))
         page.wait_for_element_visible.assert_not_called()
@@ -199,7 +199,7 @@ class ProxyProbeAndPageTests(unittest.TestCase):
 
     def test_network_error_during_verification_stops_the_token_wait(self):
         page = Mock()
-        page.execute_script.return_value = "ERR_CONNECTION_RESET"
+        page.evaluate.return_value = "ERR_CONNECTION_RESET"
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertFalse(app.wait_for_turnstile_pass(page))
         page.sleep.assert_not_called()

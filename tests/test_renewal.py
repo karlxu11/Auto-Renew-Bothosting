@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -50,9 +51,11 @@ class BillingPage:
     def sleep(self, seconds):
         self.clock.sleep(seconds)
 
-    def execute_script(self, script):
+    def evaluate(self, script):
         if "cf-turnstile-response" in script:
             return self.clock.now >= self.token_after
+        if "JSON.stringify" in script:
+            return json.dumps(self.feedback)
         return self.feedback
 
     def get_page_source(self):

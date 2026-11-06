@@ -49,6 +49,9 @@ class Browser:
         else:
             self.events.append("restore")
 
+    def evaluate(self, expression):
+        return self.execute_script(expression)
+
     def save_screenshot(self, path):
         if self.closed:
             raise RuntimeError("browser already closed")

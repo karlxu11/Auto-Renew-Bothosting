@@ -35,7 +35,7 @@ NETWORK_ERROR_CODES = (
 def browser_network_error(sb) -> str:
     """只读取可见错误代码，识别 Chrome 网络错误页。"""
     try:
-        text = sb.execute_script("return (document.body && document.body.innerText) || '';")
+        text = sb.evaluate("(document.body && document.body.innerText) || ''")
         if isinstance(text, str):
             return next((code for code in NETWORK_ERROR_CODES if code in text), "")
     except Exception:
@@ -296,15 +296,18 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
 def turnstile_is_ready(sb, submit_selector=None):
     """读取验证结果，避免再次点击已经通过的验证框。"""
     # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
-    verified = sb.execute_script(
+    # evaluate 在 WebDriver / CDP 下都接收表达式；return 必须放在函数内部。
+    verified = sb.evaluate(
         """
-        const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
-        if ([...responses].some(el => (el.value || '').trim())) return true;
-        try {
-          return Boolean(window.turnstile && window.turnstile.getResponse());
-        } catch (_) {
-          return false;
-        }
+        (() => {
+          const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
+          if ([...responses].some(el => (el.value || '').trim())) return true;
+          try {
+            return Boolean(window.turnstile && window.turnstile.getResponse());
+          } catch (_) {
+            return false;
+          }
+        })()
         """
     )
     # token 出现和前端解锁按钮可能不同步，两个条件必须同时满足。
@@ -486,23 +489,26 @@ def do_email_password_login(sb, account) -> bool:
 def get_login_feedback(sb):
     """读取页面上的可见错误提示，不读取或记录输入框内容。"""
     try:
-        messages = sb.execute_script(
+        # JSON 字符串在两种执行方式下都能直接返回，避免数组触发 WebDriver 回退。
+        messages = json.loads(sb.evaluate(
             """
-            const selectors = [
-              '[role="alert"]', '[aria-live="assertive"]',
-              '[data-sonner-toast]', '[class*="error" i]'
-            ];
-            const nodes = [...new Set(selectors.flatMap(s => [...document.querySelectorAll(s)]))];
-            return nodes
-              .filter(el => {
-                const style = getComputedStyle(el);
-                return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length;
-              })
-              .map(el => (el.innerText || '').trim())
-              .filter(Boolean)
-              .slice(0, 6);
+            JSON.stringify((() => {
+              const selectors = [
+                '[role="alert"]', '[aria-live="assertive"]',
+                '[data-sonner-toast]', '[class*="error" i]'
+              ];
+              const nodes = [...new Set(selectors.flatMap(s => [...document.querySelectorAll(s)]))];
+              return nodes
+                .filter(el => {
+                  const style = getComputedStyle(el);
+                  return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length;
+                })
+                .map(el => (el.innerText || '').trim())
+                .filter(Boolean)
+                .slice(0, 6);
+            })())
             """
-        ) or []
+        ) or "[]")
         safe_messages = []
         for message in messages:
             sanitized = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email]", str(message))

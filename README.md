@@ -134,6 +134,7 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 * Worker 每小时检查一次 KV；未到时间的账号不会启动浏览器或 GitHub Actions
 
 ### 常见问题
+- `SyntaxError: Illegal return statement`：旧版验证检测脚本不兼容 SeleniumBase 的 CDP 执行方式。更新 `app.py` 后从 `main` 分支重新 **Run workflow**；仅增加等待时间或重跑旧提交不能修复此错误。
 - `回写账号 ... 调度时间失败: HTTP 401`：检查 Cloudflare Worker 和 GitHub Actions 的 `SCHEDULER_AUTH_KEY` 是否完全一致；Cloudflare 端应设置为 Worker Secret，更新后重新部署 Worker。不要把值发到日志或聊天中。
 - 登录停留在 `/login`：新版日志会打印页面可见的错误提示（若网站提供），以及密码框是否仍显示。先按提示检查邮箱和密码；若没有提示，再从本次运行的 `renew-log` artifact 查看完整日志。
 
