@@ -2,7 +2,7 @@
 
 这是一个基于 GitHub Actions 的自动化脚本，用于登录并自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
 
-工作流支持 Cloudflare Worker 定时触发、Worker URL 手动触发和 GitHub Actions 页面手动运行。
+工作流支持 Cloudflare Worker 定时触发、账号计划页“立即触发”、Worker URL 手动触发和 GitHub Actions 页面手动运行。
 
 ⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
 
@@ -101,7 +101,7 @@ Run workflow 的账号输入提示会显示映射：`account_1=karlxu28`、`acco
 **Re-run jobs 会沿用原事件的账号选择和原提交，不能修改账号范围。** 要更换账号或使用刚推送的修复，请从 `main` 分支重新点击 **Run workflow**。
 参见 [GitHub 重跑说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)。
 
-### 查看账号续期计划
+### 查看账号续期计划与立即触发
 
 把更新后的 `workers.js` 部署到现有 Cloudflare Worker 后，访问：
 
@@ -116,7 +116,9 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 
 - 配置中存在但还没有 KV 记录的账号显示“待初始化”；旧账号显示“未配置”，不参与调度。
 - “占用中”表示调度占用期限尚未结束，不代表 GitHub Actions 的实时状态。
-- 页面只读，点击“刷新”重新读取计划，不会触发续期或改写 KV。到期后仍由下一次定时检查触发续期。
+- 点击账号行的 **立即触发**，会立刻为该账号发送 GitHub Actions 续期请求，不受“下次检查”时间限制；实际是否可以续期仍由 Bot-hosting 的冷却时间决定。页面会显示触发成功、任务占用或触发失败，并提供 GitHub Actions 入口。
+- “占用中”账号的按钮会禁用，服务端也会检查占用期限；未配置的旧账号没有触发按钮。记录异常时请先检查 KV 数据。
+- 浏览页面和点击“刷新”只读取计划，不会触发续期或改写 KV。按钮使用同源 POST，完成后返回计划页，刷新不会重复提交。
 - KV 列表和读取存在短暂延迟，刚回写的计划可能需要稍后刷新才能看到。
 
 ## 注意事项

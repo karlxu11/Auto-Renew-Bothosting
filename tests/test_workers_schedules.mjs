@@ -27,6 +27,7 @@ function fixture(values = {}, pages) {
       },
       async put(key, value) {
         calls.writes.push([key, value]);
+        values[key] = value;
       },
     },
   };
@@ -34,6 +35,11 @@ function fixture(values = {}, pages) {
 }
 
 const request = (path = `/schedules?key=${KEY}`, method = "GET") => new Request(`https://worker.example.invalid${path}`, { method });
+const triggerRequest = (accountId, {
+  path = `/schedules?key=${KEY}`,
+  origin = "https://worker.example.invalid",
+  body = new URLSearchParams({ account_id: accountId }),
+} = {}) => new Request(`https://worker.example.invalid${path}`, { method: "POST", headers: { Origin: origin }, body });
 const rowFor = (html, id) => [...html.matchAll(/<tr data-account-id="([^"]*)">([\s\S]*?)<\/tr>/g)].find((row) => row[1] === id)?.[2];
 
 test("schedules requires the existing AUTH_KEY before any KV reads", async () => {
@@ -63,8 +69,12 @@ test("lists configured accounts, historical KV accounts, and missing records wit
   }
   assert.match(rowFor(html, "account_1"), /等待中/);
   assert.match(rowFor(html, "account_2"), /待初始化/);
+  assert.match(rowFor(html, "account_2"), /<form method="post"/);
+  assert.match(rowFor(html, "account_2"), /name="account_id" value="account_2"/);
+  assert.match(rowFor(html, "account_2"), />立即触发<\/button>/);
   assert.match(rowFor(html, "account_3"), /待初始化/);
   assert.match(rowFor(html, "retired"), /未配置/);
+  assert.doesNotMatch(rowFor(html, "retired"), /<form|<button/);
   assert.match(html, /仅保留在 KV，未参与调度/);
   assert.doesNotMatch(html, /must-not-be-displayed/);
   assert.equal(new Set(calls.reads).size, 4);
@@ -128,6 +138,7 @@ test("active leases take precedence over due dates, expired leases do not", asyn
   });
   const html = await (await worker.fetch(request(), env)).text();
   assert.match(rowFor(html, "account_1"), /badge active">占用中/);
+  assert.match(rowFor(html, "account_1"), / disabled>任务占用中<\/button>/);
   assert.match(rowFor(html, "account_2"), /badge due">待检查/);
 });
 
@@ -141,6 +152,7 @@ test("a corrupt record does not hide healthy accounts", async () => {
   const html = await response.text();
   assert.equal(response.status, 200);
   assert.match(rowFor(html, "account_1"), /记录异常/);
+  assert.match(rowFor(html, "account_1"), / disabled>立即触发<\/button>/);
   assert.match(rowFor(html, "account_2"), /无效时间/);
   assert.match(rowFor(html, "account_3"), /等待中/);
 });
@@ -158,7 +170,8 @@ test("KV content is escaped and neither credentials nor the auth key appear in H
   assert.match(html, /&lt;script&gt;/);
   for (const secret of [KEY, env.GH_PAT, env.SCHEDULER_AUTH_KEY]) assert.ok(!html.includes(secret));
   assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(response.headers.get("referrer-policy"), "same-origin");
+  assert.match(response.headers.get("content-security-policy"), /form-action 'self'/);
 });
 
 test("malformed field types and non-object JSON records do not break the page", async () => {
@@ -183,10 +196,10 @@ test("the trailing slash and HEAD are read-only; unsupported methods are rejecte
   const head = await worker.fetch(request(undefined, "HEAD"), env);
   assert.equal(head.status, 200);
   assert.equal(await head.text(), "");
-  for (const method of ["POST", "PUT", "DELETE"]) {
+  for (const method of ["PUT", "DELETE"]) {
     const response = await worker.fetch(request(undefined, method), env);
     assert.equal(response.status, 405);
-    assert.equal(response.headers.get("allow"), "GET, HEAD");
+    assert.equal(response.headers.get("allow"), "GET, HEAD, POST");
   }
   assert.equal(calls.writes.length, 0);
   assert.equal(outbound.mock.callCount(), 0);
@@ -210,4 +223,108 @@ test("the existing root URL still dispatches the requested account", async (t) =
   const payload = JSON.parse(outbound.mock.calls[0].arguments[1].body);
   assert.deepEqual(payload.client_payload.account_ids, ["account_2"]);
   assert.equal(calls.writes[0][0], `${PREFIX}account_2`);
+});
+
+test("the page button immediately dispatches only the selected account and redirects safely", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 204 }));
+  const nextRun = future();
+  const { env, calls } = fixture({
+    [`${PREFIX}account_2`]: JSON.stringify({ status: "not_due", next_run_at: nextRun, in_flight_until: "2000-01-01T00:00:00Z" }),
+  });
+  Object.assign(env, { GH_PAT: "test-only-token", GH_USER: "example", GH_REPO: "renewals" });
+  const response = await worker.fetch(triggerRequest("account_2"), env);
+  assert.equal(response.status, 303);
+  const location = new URL(response.headers.get("location"));
+  assert.equal(location.pathname, "/schedules");
+  assert.equal(location.searchParams.get("key"), KEY);
+  assert.equal(location.searchParams.get("trigger"), "sent");
+  assert.equal(outbound.mock.callCount(), 1);
+  const payload = JSON.parse(outbound.mock.calls[0].arguments[1].body);
+  assert.deepEqual(payload.client_payload, { account_ids: ["account_2"], manual: true, source: "Schedules page" });
+  assert.equal(calls.writes.length, 1);
+  const [key, rawState] = calls.writes[0];
+  assert.equal(key, `${PREFIX}account_2`);
+  const state = JSON.parse(rawState);
+  assert.ok(Date.parse(state.in_flight_until) > Date.now());
+  assert.equal(state.next_run_at, nextRun);
+
+  for (let refresh = 0; refresh < 2; refresh++) {
+    const html = await (await worker.fetch(new Request(location), env)).text();
+    assert.match(html, /已为 karlxu0（account_2）\s*发送续期请求/);
+    assert.match(html, /https:\/\/github.com\/example\/renewals\/actions/);
+    assert.match(rowFor(html, "account_2"), / disabled>任务占用中<\/button>/);
+  }
+  const repeated = await worker.fetch(triggerRequest("account_2"), env);
+  assert.equal(new URL(repeated.headers.get("location")).searchParams.get("trigger"), "busy");
+  assert.equal(outbound.mock.callCount(), 1);
+  assert.equal(calls.writes.length, 1);
+});
+
+test("active accounts are rejected by the server even if the page button is bypassed", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", () => { throw new Error("Must not dispatch an occupied account"); });
+  const { env, calls } = fixture({ [`${PREFIX}account_2`]: JSON.stringify({ in_flight_until: future() }) });
+  const response = await worker.fetch(triggerRequest("account_2"), env);
+  assert.equal(response.status, 303);
+  assert.equal(new URL(response.headers.get("location")).searchParams.get("trigger"), "busy");
+  const html = await (await worker.fetch(new Request(response.headers.get("location")), env)).text();
+  assert.match(html, /已有任务占用/);
+  assert.equal(calls.writes.length, 0);
+  assert.equal(outbound.mock.callCount(), 0);
+});
+
+test("manual page triggers require authentication and a same-origin POST", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", () => { throw new Error("Must not dispatch"); });
+  const { env, calls } = fixture();
+  assert.equal((await worker.fetch(triggerRequest("account_2", { path: "/schedules" }), env)).status, 401);
+  assert.equal((await worker.fetch(triggerRequest("account_2", { path: "/schedules?key=wrong" }), env)).status, 401);
+  for (const origin of ["https://other.example.invalid", "null", ""]) {
+    assert.equal((await worker.fetch(triggerRequest("account_2", { origin }), env)).status, 403);
+  }
+  assert.equal(calls.reads.length, 0);
+  assert.equal(calls.writes.length, 0);
+  assert.equal(outbound.mock.callCount(), 0);
+});
+
+test("invalid, historical, and multiple account selections do not dispatch", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", () => { throw new Error("Must not dispatch"); });
+  const { env, calls } = fixture({ [`${PREFIX}retired`]: "{}" });
+  for (const id of ["", "retired", "unknown", "account_1,account_2"]) {
+    assert.equal((await worker.fetch(triggerRequest(id), env)).status, 400);
+  }
+  for (const body of [new URLSearchParams(), new URLSearchParams([["account_id", "account_1"], ["account_id", "account_2"]]), "not-a-form"]) {
+    assert.equal((await worker.fetch(triggerRequest("account_2", { body }), env)).status, 400);
+  }
+  assert.equal(calls.reads.length, 0);
+  assert.equal(calls.writes.length, 0);
+  assert.equal(outbound.mock.callCount(), 0);
+});
+
+test("GitHub failures leave the account available and display a failure notice", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", async () => new Response("Bad credentials", { status: 401 }));
+  const { env, calls } = fixture();
+  Object.assign(env, { GH_PAT: "test-only-token", GH_USER: "example", GH_REPO: "renewals" });
+  const response = await worker.fetch(triggerRequest("account_2", { path: `/schedules/?key=${KEY}` }), env);
+  const location = new URL(response.headers.get("location"));
+  assert.equal(response.status, 303);
+  assert.equal(location.pathname, "/schedules/");
+  assert.equal(location.searchParams.get("trigger"), "failed");
+  const html = await (await worker.fetch(new Request(location), env)).text();
+  assert.match(html, /role="alert"/);
+  assert.match(html, /触发失败/);
+  assert.doesNotMatch(rowFor(html, "account_2"), / disabled/);
+  assert.equal(calls.writes.length, 0);
+  assert.equal(outbound.mock.callCount(), 1);
+});
+
+test("missing configuration and KV failures return a failure notice without dispatch", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", () => { throw new Error("Must not dispatch"); });
+  t.mock.method(console, "error", () => {});
+  const { env, calls } = fixture();
+  let response = await worker.fetch(triggerRequest("account_2"), env);
+  assert.equal(new URL(response.headers.get("location")).searchParams.get("trigger"), "failed");
+  env.RENEWAL_STATE.get = async () => { throw new Error("KV unavailable"); };
+  response = await worker.fetch(triggerRequest("account_2"), env);
+  assert.equal(new URL(response.headers.get("location")).searchParams.get("trigger"), "failed");
+  assert.equal(calls.writes.length, 0);
+  assert.equal(outbound.mock.callCount(), 0);
 });

@@ -24,6 +24,9 @@ export default {
     }
 
     if (url.pathname === "/schedules" || url.pathname === "/schedules/") {
+      if (request.method === "POST") {
+        return triggerScheduleAccount(request, env);
+      }
       return showSchedules(request, env);
     }
 
@@ -34,28 +37,9 @@ export default {
       if (selectedIds.some((id) => !accountIds.includes(id))) {
         return new Response("Unknown account ID", { status: 400 });
       }
-      if (!env.RENEWAL_STATE) {
-        return new Response("Missing RENEWAL_STATE KV binding", { status: 500 });
-      }
-      const states = new Map();
-      for (const accountId of selectedIds) {
-        const state = await readAccountState(env, accountId);
-        const leaseUntil = Date.parse(state?.in_flight_until || "");
-        if (Number.isFinite(leaseUntil) && leaseUntil > Date.now()) {
-          return new Response(`Account ${accountId} already has a running renewal`, { status: 409 });
-        }
-        states.set(accountId, state);
-      }
-
-      const result = await triggerGithubAction(env, "Manual URL", {
-        account_ids: selectedIds,
-        manual: true,
-      });
-      if (result.ok) {
-        await persistLeases(env, selectedIds, states);
-      }
+      const result = await dispatchManualAccounts(env, selectedIds, "Manual URL");
       return new Response(stripHtml(result.message), {
-        status: result.ok ? 200 : 502,
+        status: result.status,
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
     } catch (error) {
@@ -67,9 +51,10 @@ export default {
 const SCHEDULE_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store",
-  "Referrer-Policy": "no-referrer",
+  // 保留同源表单的 Origin；外部链接仍不会收到带 key 的 Referer。
+  "Referrer-Policy": "same-origin",
   "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
 };
 
 const SCHEDULE_ACCOUNT_NAMES = {
@@ -86,9 +71,9 @@ const SCHEDULE_TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
 
 async function showSchedules(request, env) {
   if (request.method !== "GET" && request.method !== "HEAD") {
-    return new Response("仅支持 GET 和 HEAD 请求", {
+    return new Response("仅支持 GET、HEAD 和 POST 请求", {
       status: 405,
-      headers: { ...SCHEDULE_HEADERS, Allow: "GET, HEAD", "Content-Type": "text/plain; charset=utf-8" },
+      headers: { ...SCHEDULE_HEADERS, Allow: "GET, HEAD, POST", "Content-Type": "text/plain; charset=utf-8" },
     });
   }
   if (!env.RENEWAL_STATE) {
@@ -134,7 +119,11 @@ async function showSchedules(request, env) {
       records.push(...batch);
     }
 
-    const html = renderSchedules(records, new Date());
+    const notice = scheduleTriggerNotice(new URL(request.url), configured);
+    const actionsUrl = env.GH_USER && env.GH_REPO
+      ? `https://github.com/${encodeURIComponent(env.GH_USER)}/${encodeURIComponent(env.GH_REPO)}/actions`
+      : null;
+    const html = renderSchedules(records, new Date(), notice, actionsUrl);
     return new Response(request.method === "HEAD" ? null : html, { headers: SCHEDULE_HEADERS });
   } catch (error) {
     console.error("读取账号计划失败：", error.message);
@@ -143,6 +132,72 @@ async function showSchedules(request, env) {
       headers: { ...SCHEDULE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
   }
+}
+
+async function triggerScheduleAccount(request, env) {
+  const url = new URL(request.url);
+  // 页面按钮只接受同源 POST；浏览、刷新和链接预取都不会启动任务。
+  if (request.headers.get("Origin") !== url.origin) {
+    return new Response("仅允许从账号计划页触发续期。", { status: 403 });
+  }
+
+  let accountId;
+  try {
+    const form = await request.formData();
+    const ids = form.getAll("account_id");
+    if (ids.length !== 1 || typeof ids[0] !== "string") {
+      return new Response("请选择一个账号。", { status: 400 });
+    }
+    accountId = ids[0];
+  } catch {
+    return new Response("无效的触发请求。", { status: 400 });
+  }
+
+  try {
+    if (!getAccountIds(env).includes(accountId)) {
+      return new Response("未知账号或账号已移出配置。", { status: 400 });
+    }
+    const result = await dispatchManualAccounts(env, [accountId], "Schedules page");
+    url.searchParams.set("trigger", result.ok ? "sent" : result.status === 409 ? "busy" : "failed");
+  } catch (error) {
+    console.error("页面手动触发失败：", error.message);
+    url.searchParams.set("trigger", "failed");
+  }
+  url.searchParams.set("account", accountId);
+  // POST 后跳转回只读 GET，避免刷新页面重复提交。
+  return new Response(null, {
+    status: 303,
+    headers: { Location: url.toString(), "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+  });
+}
+
+async function dispatchManualAccounts(env, accountIds, source) {
+  if (!env.RENEWAL_STATE) throw new Error("Missing RENEWAL_STATE KV binding");
+  const states = new Map();
+  for (const accountId of accountIds) {
+    const state = await readAccountState(env, accountId);
+    const leaseUntil = Date.parse(state?.in_flight_until || "");
+    if (Number.isFinite(leaseUntil) && leaseUntil > Date.now()) {
+      return { ok: false, status: 409, message: `Account ${accountId} already has a running renewal` };
+    }
+    states.set(accountId, state);
+  }
+  const result = await triggerGithubAction(env, source, { account_ids: accountIds, manual: true });
+  if (result.ok) await persistLeases(env, accountIds, states);
+  return { ...result, status: result.ok ? 200 : 502 };
+}
+
+function scheduleTriggerNotice(url, configured) {
+  const id = url.searchParams.get("account");
+  if (!configured.has(id)) return null;
+  const name = Object.hasOwn(SCHEDULE_ACCOUNT_NAMES, id) ? `${SCHEDULE_ACCOUNT_NAMES[id]}（${id}）` : id;
+  const notices = {
+    sent: { kind: "success", message: `已为 ${name} 发送续期请求。任务将由 GitHub Actions 启动，请稍后刷新查看结果。` },
+    busy: { kind: "error", message: `${name} 已有任务占用，请等待完成后再触发。` },
+    failed: { kind: "error", message: `${name} 触发失败。请检查 Worker 的 GitHub 配置和运行日志后重试。` },
+  };
+  const result = url.searchParams.get("trigger");
+  return Object.hasOwn(notices, result) ? notices[result] : null;
 }
 
 function scheduleStatus(record, now) {
@@ -168,7 +223,7 @@ function renderBeijingTime(value) {
   return `<time datetime="${iso}">${label}</time>`;
 }
 
-function renderSchedules(records, now) {
+function renderSchedules(records, now, notice = null, actionsUrl = null) {
   const results = { success: "续期成功", not_due: "尚未到期", failed: "续期失败" };
   const statuses = records.map((record) => scheduleStatus(record, now.getTime()));
   const due = statuses.filter((status) => status.kind === "due").length;
@@ -183,8 +238,14 @@ function renderSchedules(records, now) {
     } else if (result !== undefined && result !== null) {
       resultLabel = "未知结果";
     }
+    const unavailable = status.kind === "active" || record.invalid;
+    const action = record.configured ? `<form method="post" class="trigger-form">
+        <input type="hidden" name="account_id" value="${escapeHtml(record.id)}">
+        <button class="trigger" type="submit" aria-label="立即触发 ${escapeHtml(name)}（${escapeHtml(record.id)}）"${unavailable ? " disabled" : ""}>${status.kind === "active" ? "任务占用中" : "立即触发"}</button>
+      </form>` : '<span class="empty">—</span>';
     return `<tr data-account-id="${escapeHtml(record.id)}">
       <td><strong class="account">${escapeHtml(name)}</strong>${name !== record.id ? `<span class="subtext">${escapeHtml(record.id)}</span>` : ""}${!record.configured ? '<span class="subtext">仅保留在 KV，未参与调度</span>' : ""}</td>
+      <td>${action}</td>
       <td><span class="badge ${status.kind}">${status.label}</span></td>
       <td>${escapeHtml(resultLabel)}</td>
       <td>${renderBeijingTime(record.state?.next_run_at)}</td>
@@ -212,6 +273,15 @@ function renderSchedules(records, now) {
     .refresh { flex-shrink: 0; padding: 10px 19px; border: 1px solid #cbd8dd; border-radius: 8px; color: #264c49; background: white; font-size: 14px; font-weight: 600; text-decoration: none; }
     .refresh:hover { background: #eaf3f0; border-color: #78a89a; }
     .refresh:focus-visible { outline: 3px solid #68ac99; outline-offset: 3px; }
+    .trigger-form { margin: 0; }
+    .trigger { border: 1px solid #39756c; border-radius: 6px; padding: 7px 12px; color: white; background: #39756c; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .trigger:hover:not(:disabled) { background: #295c54; }
+    .trigger:focus-visible { outline: 3px solid #68ac99; outline-offset: 3px; }
+    .trigger:disabled { border-color: #dfe7ea; background: #f0f2f4; color: #7b858d; cursor: not-allowed; }
+    .notice { margin: 0 0 24px; padding: 14px 18px; border: 1px solid; border-radius: 8px; font-size: 14px; line-height: 1.8; }
+    .notice.success { background: #edf7f1; color: #216c52; border-color: #c5e0d1; }
+    .notice.error { background: #fff3ed; color: #9c4826; border-color: #efd1bf; }
+    .notice a { color: inherit; font-weight: 600; margin-left: 10px; }
     .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
     .stat { border: 1px solid #dfe7ea; border-radius: 12px; background: white; padding: 21px 24px; }
     .stat dt { color: #61727d; font-size: 13px; }
@@ -250,6 +320,7 @@ function renderSchedules(records, now) {
       <div><h1>账号续期计划</h1><p class="description">查看各账号的下次检查时间。当前时间：${renderBeijingTime(now.toISOString())}</p></div>
       <a class="refresh" href="">刷新</a>
     </header>
+    ${notice ? `<div class="notice ${notice.kind}" role="${notice.kind === "error" ? "alert" : "status"}">${escapeHtml(notice.message)}${actionsUrl ? `<a href="${escapeHtml(actionsUrl)}" target="_blank" rel="noreferrer">查看运行任务 ↗</a>` : ""}</div>` : ""}
     <dl class="stats" aria-label="计划概览">
       <div class="stat"><dt>账号总数</dt><dd>${records.length}</dd></div>
       <div class="stat"><dt>待检查 / 待初始化</dt><dd>${due}</dd></div>
@@ -258,10 +329,10 @@ function renderSchedules(records, now) {
     <section class="table-panel" aria-labelledby="schedule-heading">
       <div class="table-heading"><h2 id="schedule-heading">全部账号</h2><span class="zone">北京时间（UTC+8）</span></div>
       <div class="table-scroll" role="region" aria-label="账号计划表，可横向滚动" tabindex="0">
-        <table><thead><tr><th scope="col">账号</th><th scope="col">调度状态</th><th scope="col">上次结果</th><th scope="col">下次检查（北京时间）</th><th scope="col">最近更新（北京时间）</th><th scope="col">占用截止（北京时间）</th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th scope="col">账号</th><th scope="col">操作</th><th scope="col">调度状态</th><th scope="col">上次结果</th><th scope="col">下次检查（北京时间）</th><th scope="col">最近更新（北京时间）</th><th scope="col">占用截止（北京时间）</th></tr></thead><tbody>${rows}</tbody></table>
       </div>
     </section>
-    <footer><p>页面只读。到期的账号会在下一次定时检查时尝试触发；KV 更新可能有短暂延迟。</p><p>“占用中”按调度占用期限判断，不代表 GitHub Actions 的实时状态。未配置的旧账号仅供查看。</p></footer>
+    <footer><p>点击“立即触发”可马上启动该账号的续期检查，无需等待下次定时检查。实际续期结果以任务运行结果为准。</p><p>浏览和刷新页面不会触发任务；KV 更新可能有短暂延迟。“占用中”按调度占用期限判断，不代表 GitHub Actions 的实时状态。未配置的旧账号仅供查看。</p></footer>
   </main>
 </body>
 </html>`;
