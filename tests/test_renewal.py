@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +94,49 @@ class BillingPage:
         self.clicks.append(selector)
         if selector == SUBMIT and self.is_element_enabled(selector):
             self.submitted_at = self.clock.now
+
+
+class BillingNavigationTests(unittest.TestCase):
+    def setUp(self):
+        output = contextlib.redirect_stdout(io.StringIO())
+        output.__enter__()
+        self.addCleanup(output.__exit__, None, None, None)
+
+    def browser(self, url):
+        page = Mock()
+        page.get_current_url.return_value = url
+        page.get_title.return_value = "Billing | Bot-Hosting"
+        return page
+
+    def test_current_billings_page_from_failed_run_is_accepted(self):
+        page = self.browser("https://bot-hosting.net/dash/billings")
+        self.assertTrue(app.open_billings_page(page))
+        page.open.assert_called_once_with("https://bot-hosting.net/dash/billings")
+
+    def test_legacy_billings_route_remains_compatible(self):
+        self.assertTrue(app.open_billings_page(self.browser("https://bot-hosting.net/a/billings")))
+
+    def test_login_error_and_unrelated_destinations_are_rejected(self):
+        for url in (
+            "https://bot-hosting.net/login?next=/a/billings",
+            "https://bot-hosting.net/dash/billings?error=session_expired",
+            "https://bot-hosting.net/dash",
+            "https://bot-hosting.net/a/billings-unavailable",
+            "https://example.invalid/a/billings",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(app.open_billings_page(self.browser(url)))
+
+    def test_logged_billing_page_reaches_cooldown_check_without_renewing(self):
+        page = self.browser("https://bot-hosting.net/dash/billings")
+        page.is_element_visible.return_value = False
+        page.get_page_source.return_value = "<span>Renewal cooldown 02:41:56</span>"
+        self.assertTrue(app.open_billings_page(page))
+        result = app.renew_with_retry(page)
+        self.assertEqual(result["status"], "not_due")
+        self.assertEqual(result["countdown"], "02:41:56")
+        page.click.assert_not_called()
+        self.assertEqual(page.open.call_count, 1)
 
 
 class RenewalTests(unittest.TestCase):

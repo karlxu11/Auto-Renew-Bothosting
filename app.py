@@ -585,16 +585,23 @@ def wait_for_renewal_countdown(sb, timeout=45):
 
 
 def open_billings_page(sb) -> bool:
-    """重新打开账单页，用于续期失败后的单次重试。"""
+    """登录后或续期重试前打开账单页，兼容新旧后台路径。"""
+    billings_url = "https://bot-hosting.net/dash/billings"
     try:
-        print("🌐 重新访问 https://bot-hosting.net/a/billings ...")
-        sb.open("https://bot-hosting.net/a/billings")
+        print(f"🌐 访问账单页 {billings_url} ...")
+        sb.open(billings_url)
         sb.wait_for_ready_state_complete()
         sb.sleep(3)
         current_url = sb.get_current_url()
         current_title = sb.get_title()
-        print(f"📝 重试页面 URL: {current_url}, Title: {current_title}")
-        return "a/billings" in current_url and "/login" not in current_url and "error=" not in current_url
+        print(f"📝 账单页面 URL: {current_url}, Title: {current_title}")
+        # 旧地址 /a/billings 会跳转到 /dash/billings，不能再只匹配旧地址。
+        parsed_url = urllib.parse.urlparse(current_url)
+        return (
+            parsed_url.hostname in {"bot-hosting.net", "www.bot-hosting.net"}
+            and parsed_url.path.rstrip("/") in {"/dash/billings", "/a/billings"}
+            and "error" not in urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+        )
     except Exception as e:
         print(f"❌ 重新打开账单页失败: {e}")
         return False
