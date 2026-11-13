@@ -197,12 +197,14 @@ class ProxyProbeAndPageTests(unittest.TestCase):
         page.wait_for_element_visible.assert_not_called()
         page.update_text.assert_not_called()
 
-    def test_network_error_during_verification_stops_the_token_wait(self):
+    def test_network_error_is_attached_to_the_final_failure_for_direct_recovery(self):
         page = Mock()
         page.evaluate.return_value = "ERR_CONNECTION_RESET"
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertFalse(app.wait_for_turnstile_pass(page))
-        page.sleep.assert_not_called()
+        with patch.object(app, "save_redacted_screenshot", return_value="failure.png"), patch.object(
+            app, "send_saved_failure_notification"
+        ):
+            result = app.notify_account_failure(page, {"id": "account_1"}, "renewal", "upstream renewal failed")
+        self.assertEqual(result["network_error"], "ERR_CONNECTION_RESET")
 
 
 if __name__ == "__main__":

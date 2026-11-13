@@ -1,8 +1,10 @@
+"""Verify the latest upstream renewal flow and its scheduler result adapter."""
+
 import contextlib
 import importlib.util
 import io
-import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -19,251 +21,159 @@ with patch.dict(os.environ, {"EMAIL": "test@example.invalid", "BOT_HOSTING_PASSW
     SPEC.loader.exec_module(app)
 
 
-SUBMIT = 'button:contains("Renew for 4 days")'
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = 0
-
-    def monotonic(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
+OUTER = 'button:contains("Renew free plan")'
+SUBMIT = 'div[role="dialog"] button.btn-primary'
+CLASS_OUTER = '[class*="btn btn-primary btn-sm"]'
 
 
 class BillingPage:
-    """Model an iframe challenge invisible to the outer HTML and a disabled no-op button."""
-
-    def __init__(self, clock, token_after=0, enabled_after=0, result_after=0, verification_delay=None):
-        self.clock = clock
-        self.token_after = token_after
-        self.enabled_after = enabled_after
-        self.result_after = result_after
-        self.verification_delay = verification_delay
-        self.aria_disabled = False
-        self.submitted_at = None
+    def __init__(self, button="Renew free plan", result="Expires 19 Nov 2026. Renewal cooldown 47:59:59", outer=OUTER):
+        self.button = button
+        self.outer = outer
+        self.result = result
         self.clicks = []
-        self.captcha_clicks = 0
-        self.feedback = []
+        self.sleeps = []
+        self.submitted = False
+        self.click_error = ""
+        self.text_error = False
+        self.cdp = SimpleNamespace(click_captcha=Mock())
 
     def sleep(self, seconds):
-        self.clock.sleep(seconds)
+        self.sleeps.append(seconds)
 
-    def evaluate(self, script):
-        if "cf-turnstile-response" in script:
-            return self.clock.now >= self.token_after
-        if "JSON.stringify" in script:
-            return json.dumps(self.feedback)
-        return self.feedback
-
-    def get_page_source(self):
-        if self.submitted_at is not None and self.clock.now - self.submitted_at >= self.result_after:
-            return "<button>Renewal cooldown 47:59:59</button>"
-        return '<button>Renew free plan</button><iframe src="https://challenges.cloudflare.com/"></iframe>'
+    def is_element_present(self, selector):
+        return False
 
     def is_element_visible(self, selector):
-        return True
-
-    def is_element_enabled(self, selector):
-        return self.clock.now >= self.enabled_after
-
-    def get_attribute(self, selector, attribute, **kwargs):
-        return "true" if self.aria_disabled else None
+        if selector.startswith("type:"):
+            raise ValueError("Invalid selector")
+        return selector == self.outer and self.button is not None
 
     def get_text(self, selector):
-        if "Renewal cooldown" in self.get_page_source():
-            return "Renewal cooldown 47:59:59"
-        return "Renew free plan"
+        return self.button
 
-    def wait_for_element_visible(self, selector, **kwargs):
-        pass
+    def get_page_source(self):
+        return self.result if self.submitted else "Expires 15 Nov 2026. " + (self.button or "")
 
-    def wait_for_element_clickable(self, selector, **kwargs):
-        if not self.is_element_enabled(selector):
-            raise RuntimeError("button disabled")
-
-    def uc_gui_click_captcha(self):
-        self.captcha_clicks += 1
-        if self.verification_delay is not None:
-            # 重复点击会重启验证，用于模拟长时间停留在 Verifying 的组件。
-            self.token_after = self.enabled_after = self.clock.now + self.verification_delay
+    def get_page_text(self):
+        if self.text_error:
+            raise RuntimeError("Visible text temporarily unavailable")
+        return self.get_page_source()
 
     def click(self, selector, **kwargs):
         self.clicks.append(selector)
-        if selector == SUBMIT and self.is_element_enabled(selector):
-            self.submitted_at = self.clock.now
-
-
-class BillingNavigationTests(unittest.TestCase):
-    def setUp(self):
-        output = contextlib.redirect_stdout(io.StringIO())
-        output.__enter__()
-        self.addCleanup(output.__exit__, None, None, None)
-
-    def browser(self, url):
-        page = Mock()
-        page.get_current_url.return_value = url
-        page.get_title.return_value = "Billing | Bot-Hosting"
-        return page
-
-    def test_current_billings_page_from_failed_run_is_accepted(self):
-        page = self.browser("https://bot-hosting.net/dash/billings")
-        self.assertTrue(app.open_billings_page(page))
-        page.open.assert_called_once_with("https://bot-hosting.net/dash/billings")
-
-    def test_legacy_billings_route_remains_compatible(self):
-        self.assertTrue(app.open_billings_page(self.browser("https://bot-hosting.net/a/billings")))
-
-    def test_login_error_and_unrelated_destinations_are_rejected(self):
-        for url in (
-            "https://bot-hosting.net/login?next=/a/billings",
-            "https://bot-hosting.net/dash/billings?error=session_expired",
-            "https://bot-hosting.net/dash",
-            "https://bot-hosting.net/a/billings-unavailable",
-            "https://example.invalid/a/billings",
-        ):
-            with self.subTest(url=url):
-                self.assertFalse(app.open_billings_page(self.browser(url)))
-
-    def test_logged_billing_page_reaches_cooldown_check_without_renewing(self):
-        page = self.browser("https://bot-hosting.net/dash/billings")
-        page.is_element_visible.return_value = False
-        page.get_page_source.return_value = "<span>Renewal cooldown 02:41:56</span>"
-        self.assertTrue(app.open_billings_page(page))
-        result = app.renew_with_retry(page)
-        self.assertEqual(result["status"], "not_due")
-        self.assertEqual(result["countdown"], "02:41:56")
-        page.click.assert_not_called()
-        self.assertEqual(page.open.call_count, 1)
+        if selector == self.click_error:
+            raise RuntimeError("Click failed")
+        if selector == SUBMIT:
+            self.submitted = True
 
 
 class RenewalTests(unittest.TestCase):
     def setUp(self):
-        self.clock = FakeClock()
-        self.output = io.StringIO()
         for manager in (
-            patch.object(app, "time", self.clock),
-            patch.object(app, "save_renewal_screenshot", side_effect=lambda sb, attempt: f"renew_result_{attempt}.png"),
-            contextlib.redirect_stdout(self.output),
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.object(app.time, "sleep"),
+            patch.object(app, "wait_turnstile_present", return_value=False),
+            patch.object(app, "save_renewal_screenshot", return_value="renew_result_1.png"),
         ):
             manager.__enter__()
             self.addCleanup(manager.__exit__, None, None, None)
 
-    def test_absent_outer_challenge_text_does_not_allow_submission(self):
-        page = BillingPage(self.clock, token_after=float("inf"))
-        result = app.attempt_renewal(page, 1)
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("未提交续期", result["error"])
+    def test_latest_modal_selector_and_countdown_confirm_success(self):
+        page = BillingPage()
+        result = app.renew_current_page(page)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["countdown"], "47:59:59")
+        self.assertEqual(result["expiry_date"], "19 Nov 2026")
         self.assertEqual(result["screenshot"], "renew_result_1.png")
-        self.assertNotIn(SUBMIT, page.clicks)
-        self.assertEqual(page.captcha_clicks, 3)
+        self.assertEqual(page.clicks, [OUTER, SUBMIT])
+        self.assertEqual(page.sleeps, [3, 2, 15, 6])
+        app.time.sleep.assert_called_once_with(5)
 
-    def test_token_alone_does_not_allow_clicking_disabled_button(self):
-        page = BillingPage(self.clock, enabled_after=float("inf"))
-        result = app.attempt_renewal(page, 1)
-        self.assertEqual(result["status"], "failed")
-        self.assertNotIn(SUBMIT, page.clicks)
-
-    def test_aria_disabled_is_respected(self):
-        page = BillingPage(self.clock)
-        page.aria_disabled = True
-        self.assertFalse(app.wait_for_turnstile_pass(page, timeout=3, submit_selector=SUBMIT))
-
-    def test_waits_for_token_and_button_then_delayed_result(self):
-        page = BillingPage(self.clock, token_after=3, enabled_after=6, result_after=18)
-        result = app.attempt_renewal(page, 1)
+    def test_updated_expiry_confirms_success_without_a_countdown_as_upstream_does(self):
+        result = app.renew_current_page(BillingPage(result="Expires 19 Nov 2026"))
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["countdown"], "47:59:59")
-        self.assertEqual(page.submitted_at, 6)
-        self.assertEqual(self.clock.now, 24)
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
+        self.assertEqual(result["expiry_date"], "19 Nov 2026")
+        self.assertNotIn("countdown", result)
 
-    def test_verification_can_succeed_on_a_later_checkbox_attempt(self):
-        page = BillingPage(self.clock, token_after=75, enabled_after=75)
-        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
-        self.assertEqual(page.captcha_clicks, 2)
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
-
-    def test_slow_verification_is_not_restarted_before_it_completes(self):
-        page = BillingPage(
-            self.clock, token_after=float("inf"), enabled_after=float("inf"), verification_delay=50,
-        )
-        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
-        self.assertEqual(page.captcha_clicks, 1)
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
-
-    def test_automatically_verified_popup_does_not_click_the_challenge_again(self):
-        page = BillingPage(self.clock, token_after=3, enabled_after=4)
-        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
-        self.assertEqual(page.captcha_clicks, 0)
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
-
-    def test_verification_during_retry_pause_avoids_a_second_checkbox_click(self):
-        page = BillingPage(self.clock, token_after=68, enabled_after=68)
-        self.assertEqual(app.attempt_renewal(page, 1)["status"], "success")
-        self.assertEqual(page.captcha_clicks, 1)
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
-
-    def test_verification_is_checked_at_the_timeout_boundary(self):
-        page = BillingPage(self.clock, token_after=3, enabled_after=3)
-        self.assertTrue(app.wait_for_turnstile_pass(page, timeout=3, submit_selector=SUBMIT))
-
-    def test_click_without_confirmed_result_is_not_success(self):
-        page = BillingPage(self.clock, result_after=float("inf"))
-        page.feedback = ["Verification expired"]
-        result = app.attempt_renewal(page, 1)
+    def test_unchanged_expiry_with_no_countdown_remains_a_failed_unknown_result(self):
+        page = BillingPage(result="Expires 15 Nov 2026")
+        result = app.renew_current_page(page)
         self.assertEqual(result["status"], "failed")
-        self.assertIn("45 秒", result["error"])
-        self.assertEqual(self.clock.now - page.submitted_at, 45)
+        self.assertIn("到期日期未变化", result["error"])
         self.assertEqual(page.clicks.count(SUBMIT), 1)
-        self.assertIn("Verification expired", self.output.getvalue())
+        app.save_renewal_screenshot.assert_not_called()
 
-    def test_refresh_can_confirm_previous_submission_without_submitting_again(self):
-        page = BillingPage(self.clock, result_after=50)
+    def test_cooldown_does_not_click_any_renewal_button(self):
+        page = BillingPage(button="Renewal cooldown 02:41:56", outer=CLASS_OUTER)
+        result = app.renew_current_page(page)
+        self.assertEqual(result["status"], "not_due")
+        self.assertEqual(result["countdown"], "02:41:56")
+        self.assertEqual(page.clicks, [])
+        app.save_renewal_screenshot.assert_not_called()
 
-        def refresh(sb):
-            self.clock.sleep(8)
-            return True
+    def test_renew_in_cooldown_is_supported(self):
+        self.assertEqual(app.renew_current_page(BillingPage(button="Renew in 12:34:56"))["countdown"], "12:34:56")
 
-        with patch.object(app, "open_billings_page", side_effect=refresh):
-            result = app.renew_with_retry(page)
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["countdown"], "47:59:59")
+    def test_upstream_class_selector_is_a_fallback_for_the_outer_button(self):
+        page = BillingPage(outer=CLASS_OUTER)
+        self.assertEqual(app.renew_current_page(page)["status"], "success")
+        self.assertEqual(page.clicks[0], CLASS_OUTER)
+
+    def test_missing_button_maps_unknown_state_to_scheduler_failure(self):
+        page = BillingPage(button=None)
+        self.assertEqual(app.renew_current_page(page)["status"], "failed")
+        self.assertEqual(page.clicks, [])
+
+    def test_outer_click_failure_does_not_retry_the_renewal(self):
+        page = BillingPage()
+        page.click_error = OUTER
+        self.assertEqual(app.renew_current_page(page)["status"], "failed")
+        self.assertEqual(page.clicks, [OUTER])
+
+    def test_failed_submit_does_not_claim_success_when_the_page_has_not_changed(self):
+        page = BillingPage()
+        page.click_error = SUBMIT
+        self.assertEqual(app.renew_current_page(page)["status"], "failed")
         self.assertEqual(page.clicks.count(SUBMIT), 1)
 
-    def test_retry_reloads_and_gets_a_fresh_challenge(self):
-        page = BillingPage(self.clock, token_after=float("inf"))
+    def test_page_source_is_used_if_visible_text_reading_fails(self):
+        page = BillingPage()
+        page.text_error = True
+        self.assertEqual(app.renew_current_page(page)["status"], "success")
 
-        def refresh(sb):
-            page.token_after = self.clock.now + 2
-            page.enabled_after = self.clock.now + 2
-            return True
+    def test_present_challenge_uses_upstream_solver(self):
+        page = BillingPage()
+        with patch.object(app, "wait_turnstile_present", return_value=True), patch.object(app, "handle_turnstile", return_value=True) as solve:
+            self.assertEqual(app.renew_current_page(page)["status"], "success")
+        solve.assert_called_once_with(page)
 
-        with patch.object(app, "open_billings_page", side_effect=refresh) as reload:
-            result = app.renew_with_retry(page)
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["screenshot"], "renew_result_2.png")
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
-        reload.assert_called_once()
+    def test_failed_solver_rechecks_the_token_after_upstream_fallback(self):
+        page = BillingPage()
+        with patch.object(app, "wait_turnstile_present", return_value=True), patch.object(
+            app, "handle_turnstile", return_value=False
+        ), patch.object(app, "turnstile_token", return_value="fallback-token"):
+            self.assertEqual(app.renew_current_page(page)["status"], "success")
+        page.cdp.click_captcha.assert_called_once_with()
 
-    def test_persistent_verification_failure_stops_after_two_attempts(self):
-        page = BillingPage(self.clock, token_after=float("inf"))
-        with patch.object(app, "open_billings_page", return_value=True) as reload:
-            result = app.renew_with_retry(page)
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["screenshot"], "renew_result_2.png")
+    def test_failed_challenge_never_clicks_the_modal_submit(self):
+        page = BillingPage()
+        with patch.object(app, "wait_turnstile_present", return_value=True), patch.object(
+            app, "handle_turnstile", return_value=False
+        ), patch.object(app, "turnstile_token", return_value=""):
+            self.assertEqual(app.renew_current_page(page)["status"], "failed")
         self.assertNotIn(SUBMIT, page.clicks)
-        self.assertEqual(page.captcha_clicks, 6)
-        reload.assert_called_once()
 
-    def test_login_also_requires_a_positive_token(self):
-        page = BillingPage(self.clock, token_after=2)
-        self.assertTrue(app.wait_for_turnstile_pass(page, timeout=3))
-        self.assertEqual(self.clock.now, 2)
+    def test_latest_upstream_date_formats_are_extracted(self):
+        for text, expected in (
+            ("Expires 19 November 2026", "19 November 2026"),
+            ("Expires 11/19/2026", "2026/11/19"),
+            ("Expires 2026-11-19", "2026-11-19"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(app.extract_expiry_date(text), expected)
 
-    def test_failed_account_marks_action_failed_after_processing_and_reporting_all_accounts(self):
+    def test_one_failed_account_does_not_prevent_reporting_the_rest(self):
         accounts = [{"id": "first"}, {"id": "second"}]
         results = [{"status": "failed", "error": "verification failed"}, {"status": "not_due"}]
         with patch.object(app, "load_accounts", return_value=accounts), patch.object(
@@ -279,6 +189,46 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(report.call_count, 2)
         self.assertEqual(report.call_args_list[0].args, (accounts[0], results[0]))
         self.assertEqual(report.call_args_list[1].args, (accounts[1], results[1]))
+
+
+class BillingNavigationTests(unittest.TestCase):
+    def test_current_upstream_billings_page_is_used(self):
+        page = Mock()
+        page.get_current_url.return_value = "https://bot-hosting.net/dash/billings"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(app.open_billings_page(page))
+        page.open.assert_called_once_with("https://bot-hosting.net/dash/billings")
+
+    def test_login_or_error_redirect_is_not_accepted(self):
+        for url in ("https://bot-hosting.net/login", "https://bot-hosting.net/dash/billings?error=session_expired"):
+            page = Mock()
+            page.get_current_url.return_value = url
+            with self.subTest(url=url), contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(app.open_billings_page(page))
+
+
+class SchedulerAdapterTests(unittest.TestCase):
+    def test_upstream_results_keep_the_existing_per_account_schedule_contract(self):
+        now = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        account = {"id": "account_2", "name": "Second account"}
+        for result, delay in (
+            ({"status": "success", "countdown": "47:59:59"}, timedelta(seconds=47 * 3600 + 59 * 60 + 59 + 120)),
+            ({"status": "not_due", "countdown": "02:41:56"}, timedelta(seconds=2 * 3600 + 41 * 60 + 56 + 120)),
+            ({"status": "success", "expiry_date": "19 Nov 2026"}, timedelta(hours=24)),
+            ({"status": "failed", "error": "unknown upstream result"}, timedelta(hours=6)),
+        ):
+            with self.subTest(result=result), patch.object(app, "datetime") as clock, patch.object(
+                app.requests, "post"
+            ) as post, patch.object(app, "SCHEDULER_URL", "https://scheduler.example.invalid"), patch.object(
+                app, "SCHEDULER_AUTH_KEY", "test-key"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                clock.now.return_value = now
+                app.report_account_schedule(account, result)
+                payload = post.call_args.kwargs["json"]
+                self.assertEqual(payload["account_id"], "account_2")
+                self.assertEqual(payload["status"], result["status"])
+                self.assertEqual(payload["next_run_at"], (now + delay).isoformat().replace("+00:00", "Z"))
+                self.assertEqual(post.call_args.args[0], "https://scheduler.example.invalid/api/schedule")
 
 
 if __name__ == "__main__":

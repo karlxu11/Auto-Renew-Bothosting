@@ -30,13 +30,31 @@ const feedback = (state.feedback || []).map(item => ({
   getClientRects: () => item.hidden ? [] : [{}],
   hidden: item.hidden,
 }));
+const widget = rect => ({getBoundingClientRect: () => rect});
+const widgets = (state.widgets || []).map(widget);
+const shadowWidgets = (state.shadowWidgets || []).map(widget);
+const parents = (state.tokenParents || []).map(widget);
+parents.forEach((el, i) => el.parentElement = parents[i + 1] || null);
 const context = vm.createContext({
   document: {
     body: {innerText: state.body || ''},
-    querySelectorAll: selector => selector === '[name="cf-turnstile-response"]'
-      ? (state.tokens || []).map(value => ({value})) : feedback,
+    querySelectorAll: selector => {
+      if (selector === '[name="cf-turnstile-response"]' || selector === 'input[name="cf-turnstile-response"]')
+        return (state.tokens || []).map(value => ({value}));
+      if (selector.includes('iframe[src*=')) return widgets;
+      if (selector === '*') return shadowWidgets.length ? [{shadowRoot: {
+        querySelectorAll: selector => selector === '*' ? [] : shadowWidgets,
+      }}] : [];
+      return feedback;
+    },
+    querySelector: selector => {
+      const tokens = state.tokens || [];
+      if (tokens.length || parents.length) return {value: tokens[0] || '', parentElement: parents[0]};
+      return selector.includes('iframe') ? (widgets[0] || null) : null;
+    },
   },
-  window: {turnstile: {getResponse: () => {
+  window: {screenX: 20, screenY: 30, outerHeight: 800, innerHeight: 720,
+    turnstile: {getResponse: () => {
     if (state.apiError) throw new Error('widget not ready');
     return state.apiToken || '';
   }}},
@@ -53,6 +71,7 @@ class JavaScriptBrowser:
     def __init__(self, mode, **state):
         self.mode = mode
         self.state = state
+        self.cdp = SimpleNamespace(evaluate=self._run_script)
 
     def evaluate(self, expression):
         result = self._run_script(expression)
@@ -87,33 +106,55 @@ class JavaScriptBrowser:
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute the browser scripts")
 class BrowserScriptTests(unittest.TestCase):
+    def test_upstream_script_returns_viewport_coordinates_in_both_modes(self):
+        for mode in ("webdriver", "cdp"):
+            with self.subTest(mode=mode):
+                browser = JavaScriptBrowser(mode, widgets=[{"x": 100, "y": 200, "width": 300, "height": 60}])
+                self.assertEqual(app.js(browser, app.TS_COORDS_JS), {"cx": 130, "cy": 230})
+
+    def test_widget_in_open_shadow_dom_remains_locatable(self):
+        for mode in ("webdriver", "cdp"):
+            with self.subTest(mode=mode):
+                browser = JavaScriptBrowser(mode, shadowWidgets=[{"x": 100, "y": 200, "width": 300, "height": 60}])
+                self.assertEqual(app.js(browser, app.TS_COORDS_JS), {"cx": 130, "cy": 230})
+
+    def test_token_parent_can_locate_the_widget_when_iframe_is_unavailable(self):
+        for mode in ("webdriver", "cdp"):
+            with self.subTest(mode=mode):
+                browser = JavaScriptBrowser(mode, tokenParents=[
+                    {"x": 0, "y": 0, "width": 0, "height": 0},
+                    {"x": 100, "y": 200, "width": 300, "height": 60},
+                ])
+                self.assertEqual(app.js(browser, app.TS_COORDS_JS), {"cx": 130, "cy": 230})
+
+    def test_absent_or_unrendered_widgets_do_not_produce_click_coordinates(self):
+        for mode in ("webdriver", "cdp"):
+            for state in ({}, {"widgets": [{"x": 0, "y": 0, "width": 0, "height": 0}]}):
+                with self.subTest(mode=mode, state=state):
+                    self.assertIsNone(app.js(JavaScriptBrowser(mode, **state), app.TS_COORDS_JS))
+
     def test_token_in_response_field_is_detected_in_both_browser_modes(self):
         for mode in ("webdriver", "cdp"):
             with self.subTest(mode=mode):
-                self.assertTrue(app.turnstile_is_ready(JavaScriptBrowser(mode, tokens=["", "valid-token"])))
+                self.assertEqual(app.turnstile_token(JavaScriptBrowser(mode, tokens=["valid-token"])), "valid-token")
 
     def test_turnstile_api_can_supply_the_token(self):
         for mode in ("webdriver", "cdp"):
             with self.subTest(mode=mode):
-                self.assertTrue(app.turnstile_is_ready(JavaScriptBrowser(mode, apiToken="valid-token")))
+                self.assertEqual(app.turnstile_token(JavaScriptBrowser(mode, apiToken="valid-token")), "valid-token")
 
     def test_pending_or_uninitialized_challenge_is_not_accepted(self):
         for mode in ("webdriver", "cdp"):
-            for state in ({"tokens": ["", " "]}, {"apiError": True}):
+            for state in ({"tokens": [""]}, {"apiError": True}):
                 with self.subTest(mode=mode, state=state):
-                    self.assertFalse(app.turnstile_is_ready(JavaScriptBrowser(mode, **state)))
+                    self.assertEqual(app.turnstile_token(JavaScriptBrowser(mode, **state)), "")
 
-    def test_visible_feedback_is_returned_and_email_is_redacted(self):
+    def test_turnstile_presence_does_not_require_a_completed_token(self):
         for mode in ("webdriver", "cdp"):
             with self.subTest(mode=mode):
-                browser = JavaScriptBrowser(mode, feedback=[
-                    {"text": "  Verification expired for test@example.invalid  "},
-                    {"text": "Hidden error", "hidden": True},
-                    {"text": "Try again"},
-                ])
-                self.assertEqual(app.get_login_feedback(browser), [
-                    "Verification expired for [email]", "Try again",
-                ])
+                browser = JavaScriptBrowser(mode, tokens=[""])
+                self.assertTrue(app.js(browser, app.TURNSTILE_EXISTS_JS))
+                self.assertEqual(app.turnstile_token(browser), "")
 
     def test_browser_network_errors_remain_detectable(self):
         for mode in ("webdriver", "cdp"):

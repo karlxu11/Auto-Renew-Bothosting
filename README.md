@@ -126,20 +126,27 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
 * VPNGate 不可用时仍会直连尝试续期；直连出口同样可能受到目标站的 Cloudflare 限制
 * 代理失效时会先保留脱敏现场截图，再尝试直连恢复；Telegram 只通知本次最终结果，直连也失败时发送最后失败页面，所有失败现场仍保存在 `renew-log` artifact
-* 邮箱密码填写完成后等待 10 秒，再点击 Cloudflare 验证复选框；最多尝试 3 次，确认验证通过后才点击 Sign in，未通过时本次登录会失败
-* 登录中间步骤截图仅保存在运行环境本地；登录、打开账单页、续期最终失败或浏览器内执行异常时，会在关闭浏览器前截取最后页面并发送到 Telegram，截图时遮住凭据输入框；无法截图时发送文字说明
-* 续期失败时会重新打开账单页自动重跑 1 次，最多执行 2 次续期尝试
-* 续期弹窗打开后先等待 5 秒加载验证组件；最多尝试 3 次验证，每次点击后最多等待 60 秒，重试前再等待 5 秒并复查是否已经通过，避免反复点击正在验证的组件；必须检测到 Turnstile token 且续期按钮已启用才提交，不能仅凭外层页面没有验证提示判断通过
-* 提交续期后最多等待 45 秒，出现新的续期倒计时才确认成功；刷新账单页后已出现倒计时则不重复提交
+* 登录与续期采用上游 `3835a43` 的流程：先点击 Continue with email，再填写邮箱密码，提交后访问 `/dash/billings` 确认登录状态；浏览器语言固定为 `en-US`
+* 验证框沿用上游的 iframe、Shadow DOM 和隐藏 token 父节点定位、系统鼠标点击及 CDP 兜底；出现验证码组件时使用上游的 90 秒处理流程
+* 登录、打开账单页、续期失败或浏览器内执行异常时，会在关闭浏览器前截取最后页面并发送到 Telegram，截图时遮住凭据输入框；无法截图时发送文字说明
+* 每次浏览器会话只执行一轮上游续期流程，不额外重跑续期；VPNGate 网络故障时仍保留全新浏览器直连恢复
+* 点击外部续期按钮后按上游等待 15 秒，再处理验证并点击 `div[role="dialog"] button.btn-primary`；未检测到验证码组件时沿用上游的直接提交流程
+* 提交续期后按上游等待 6 秒，新倒计时出现或到期日期发生变化时确认成功；结果未知按失败记录并由 Worker 延后检查
 * `renew-log` artifact 包含运行日志、续期截图和最终失败的脱敏截图（不含登录中间步骤截图）；任一账号最终失败会让 Actions 标红，其余账号仍会继续处理并回写调度
 * 请遵守 Bot-hosting 服务条款，合理使用自动续期
 * Worker 每小时检查一次 KV；未到时间的账号不会启动浏览器或 GitHub Actions
+
+### 上游同步
+
+已合入 `eooce/Auto-Renew-Bothosting` 的 `3835a43`。登录、验证码处理、按钮选择、等待时长和续期结果判断采用上游最新版；Actions runner 同步为 `ubuntu-24.04`。
+多账号、Cloudflare Worker 调度、VPNGate 和截图通知继续沿用本项目配置；密码 Secret 仍为 `BOT_HOSTING_PASSWORD`（多账号仍用 `BOT_HOSTING_ACCOUNTS`），无需改成上游的 `PASSWORD`。
+上游的续期结果转换为本项目的 `success`、`not_due` 或 `failed` 后回写 Worker。有倒计时时据此安排下次检查；仅到期日期变化的成功结果延后 24 小时检查；失败或状态未知延后 6 小时检查。原先额外的续期重跑和自定义 45 秒结果轮询已移除。
 
 ### 常见问题
 - 截图已显示 Billing 和续期倒计时，却提示“邮箱登录后未能打开账单页”：网站已将旧地址 `/a/billings` 跳转至 `/dash/billings`。新版 `app.py` 已兼容新旧路径；更新后从 `main` 分支重新 **Run workflow**，重跑旧提交仍会误报。
 - `SyntaxError: Illegal return statement`：旧版验证检测脚本不兼容 SeleniumBase 的 CDP 执行方式。更新 `app.py` 后从 `main` 分支重新 **Run workflow**；仅增加等待时间或重跑旧提交不能修复此错误。
 - `回写账号 ... 调度时间失败: HTTP 401`：检查 Cloudflare Worker 和 GitHub Actions 的 `SCHEDULER_AUTH_KEY` 是否完全一致；Cloudflare 端应设置为 Worker Secret，更新后重新部署 Worker。不要把值发到日志或聊天中。
-- 登录停留在 `/login`：新版日志会打印页面可见的错误提示（若网站提供），以及密码框是否仍显示。先按提示检查邮箱和密码；若没有提示，再从本次运行的 `renew-log` artifact 查看完整日志。
+- 登录停留在 `/login`：检查邮箱密码，并从本次运行的 `renew-log` artifact 查看完整日志和最终失败截图；浏览器仍按上游流程通过访问 `/dash/billings` 确认登录状态。
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。

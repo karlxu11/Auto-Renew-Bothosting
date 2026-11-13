@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, requests, html
+import os, re, sys, time, json, requests, random, subprocess, ctypes
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -13,7 +13,7 @@ EMAIL         = os.environ.get("EMAIL") or ""           # Bot-hosting 登录邮�
 BOT_HOSTING_PASSWORD = os.environ.get("BOT_HOSTING_PASSWORD") or ""  # Bot-hosting 登录密码
 BOT_HOSTING_ACCOUNTS = os.environ.get("BOT_HOSTING_ACCOUNTS") or ""  # 多账号 JSON 配置
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token
 SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "").strip().rstrip("/")
 SCHEDULER_AUTH_KEY = os.environ.get("SCHEDULER_AUTH_KEY") or ""
 
@@ -24,6 +24,7 @@ if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
 # 记录本次登录方式（用于通知）
 _LOGIN_METHOD = "Email + Password"
 _ACCOUNT_NAME = ""
+BASE_URL = "https://bot-hosting.net"
 NETWORK_ERROR_CODES = (
     "ERR_SOCKS_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
     "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_TIMED_OUT",
@@ -266,7 +267,7 @@ def save_renewal_screenshot(sb, attempt_number: int) -> str:
     return ""
 
 # 通知格式
-def format_notification(status: str, extra: str = "", error: str = "") -> str:
+def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -276,14 +277,16 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****' 
-    
+        masked_email = EMAIL[:2] + '****'
+
     lines = [
         "🇫🇮 Bot-hosting 续期通知",
         "",
         f"{status}",
         f"👤 登录账户: {_ACCOUNT_NAME} ({masked_email})" if _ACCOUNT_NAME else f"👤 登录账户: {masked_email}",
     ]
+    if expiry_date:
+        lines.append(f"📅 到期时间: {expiry_date}")
     if _LOGIN_METHOD:
         lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
     if extra:
@@ -293,52 +296,228 @@ def format_notification(status: str, extra: str = "", error: str = "") -> str:
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
-def turnstile_is_ready(sb, submit_selector=None):
-    """读取验证结果，避免再次点击已经通过的验证框。"""
-    # 验证提示位于跨域 iframe 内，不能用外层 HTML 中没有提示来判断通过。
-    # evaluate 在 WebDriver / CDP 下都接收表达式；return 必须放在函数内部。
-    verified = sb.evaluate(
-        """
-        (() => {
-          const responses = document.querySelectorAll('[name="cf-turnstile-response"]');
-          if ([...responses].some(el => (el.value || '').trim())) return true;
-          try {
-            return Boolean(window.turnstile && window.turnstile.getResponse());
-          } catch (_) {
-            return false;
-          }
-        })()
-        """
-    )
-    # token 出现和前端解锁按钮可能不同步，两个条件必须同时满足。
-    return bool(verified and (
-        not submit_selector
-        or (
-            sb.is_element_visible(submit_selector)
-            and sb.is_element_enabled(submit_selector)
-            and sb.get_attribute(submit_selector, "aria-disabled", hard_fail=False) != "true"
-        )
-    ))
+# ---------- 基础工具 ----------
+def js(sb, script, default=None, errors=None):
+    try:
+        result = sb.execute_script(script)
+        return default if result is None else result
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"execute_script: {type(e).__name__}: {e}")
+        try:
+            result = sb.cdp.evaluate("(function(){ " + script + " })()")
+            return default if result is None else result
+        except Exception as e2:
+            if errors is not None:
+                errors.append(f"cdp.evaluate: {type(e2).__name__}: {e2}")
+            return default
 
+# Turnstile 定位失败时的现场诊断快照
+def diag_turnstile_dom(sb, errors=None):
+    snap = js(sb, """
+        var out = [];
+        var ifr = document.querySelectorAll('iframe');
+        out.push('top-doc iframes: ' + ifr.length);
+        for (var i = 0; i < ifr.length; i++) {
+            var r = ifr[i].getBoundingClientRect();
+            out.push('iframe w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ' src=' + (ifr[i].src || '').slice(0, 90));
+        }
+        var ts = document.querySelectorAll('[class*="turnstile"], [id*="turnstile"], input[name="cf-turnstile-response"]');
+        out.push('turnstile-ish elements: ' + ts.length);
+        for (var j = 0; j < ts.length; j++) {
+            var rr = ts[j].getBoundingClientRect();
+            var cls = (typeof ts[j].className === 'string') ? ts[j].className : (ts[j].getAttribute('class') || '');
+            out.push(' - ' + ts[j].tagName + ' class=' + cls + ' w=' + Math.round(rr.width) + ' h=' + Math.round(rr.height));
+        }
+        out.push('window.turnstile=' + (typeof window.turnstile) + ' readyState=' + document.readyState);
+        return out.join('\\n');
+    """, "")
+    for line in str(snap).splitlines():
+        print("   [diag] " + line)
+    if errors:
+        for err in errors:
+            print("   [diag][exec-error] " + str(err)[:200])
 
-# 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30, submit_selector=None):
-    deadline = time.monotonic() + timeout
-    while True:
-        network_error = browser_network_error(sb)
-        if network_error:
-            print(f"❌ 验证页面网络连接失败: {network_error}")
-            return False
-        if turnstile_is_ready(sb, submit_selector):
-            print("✅ Cloudflare 验证已通过" + ("，续期按钮已启用" if submit_selector else ""))
+#  页面注入脚本
+# Turnstile token（官方 JS 接口 或 表单隐藏域），未通过时为空串
+TURNSTILE_TOKEN_JS = """
+try { if (window.turnstile && window.turnstile.getResponse) {
+        var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
+var el = document.querySelector('input[name="cf-turnstile-response"]');
+return el ? (el.value || '') : '';
+"""
+
+TURNSTILE_EXISTS_JS = """
+return document.querySelector(
+    'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile'
+) !== null;
+"""
+TS_COORDS_JS = """
+function findWidget(root) {
+    var els = root.querySelectorAll(
+        'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"]');
+    for (var i = 0; i < els.length; i++) {
+        var r = els[i].getBoundingClientRect();
+        if (r.width > 50 && r.height > 20) return els[i];
+    }
+    var all = root.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot) {
+            var f = findWidget(all[j].shadowRoot);
+            if (f) return f;
+        }
+    }
+    return null;
+}
+function boxFromTokenInput() {
+    var el = document.querySelector('input[name="cf-turnstile-response"]');
+    var cur = el ? el.parentElement : null;
+    for (var k = 0; k < 6 && cur; k++) {
+        var r = cur.getBoundingClientRect();
+        if (r.width > 100 && r.width < 600 && r.height > 30 && r.height < 140) return cur;
+        cur = cur.parentElement;
+    }
+    return null;
+}
+var hit = findWidget(document) || boxFromTokenInput();
+if (!hit) return null;
+var hr = hit.getBoundingClientRect();
+return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
+"""
+
+# Turnstile 脚本异步渲染，轮询等待组件出现
+def wait_turnstile_present(sb, timeout=12):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if js(sb, TURNSTILE_EXISTS_JS, False):
             return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        sb.sleep(min(1, remaining))
-    print("❌ Turnstile 验证超时或提交按钮仍未启用")
+        time.sleep(1)
     return False
-    
+
+def _activate_window():
+    if os.name == "nt":
+        return
+
+    for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
+        try:
+            r = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", cls], capture_output=True, text=True, timeout=3)
+            wids = [w for w in r.stdout.strip().split("\n") if w.strip()]
+            if wids:
+                subprocess.run(["xdotool", "windowactivate", "--sync", wids[0]], timeout=3, stderr=subprocess.DEVNULL)
+                time.sleep(0.2)
+                return
+        except Exception:
+            pass
+    try:
+        subprocess.run(["xdotool", "getactivewindow", "windowactivate"], timeout=3, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def _windows_mouse_click(x: int, y: int):
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.08)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+    except Exception:
+        pass
+
+def _xdotool_click(x: int, y: int):
+    if os.name == "nt":
+        _windows_mouse_click(x, y)
+        return
+
+    _activate_window()
+    try:
+        subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
+        time.sleep(0.15)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+
+def turnstile_token(sb) -> str:
+    token = js(sb, TURNSTILE_TOKEN_JS, "")
+    return token if isinstance(token, str) else ""
+
+def _click_turnstile(sb, locate_timeout=10) -> bool:
+    coords = None
+    errors = []
+    deadline = time.time() + locate_timeout
+    while time.time() < deadline:
+        coords = js(sb, TS_COORDS_JS, None, errors)
+        if coords:
+            break
+        time.sleep(1)
+    if not coords:
+        print("⚠️ 无法定位 Turnstile 坐标, 打印现场诊断:")
+        diag_turnstile_dom(sb, errors)
+        return False
+
+    try:
+        wi = js(sb, "return '' + (window.screenX || 0) + '|' + (window.screenY || 0) + '|' +"
+                    " window.outerHeight + '|' + window.innerHeight;", "")
+        parts = str(wi).split("|")
+        sx, sy = int(parts[0] or 0), int(parts[1] or 0)
+        bar = int(parts[2] or 800) - int(parts[3] or 768)
+        ax = int(coords["cx"]) + sx
+        ay = int(coords["cy"]) + sy + bar
+        print(f"🖱️ 底层点击 Turnstile ({ax}, {ay})")
+        _xdotool_click(ax, ay)
+        time.sleep(3)
+        return True
+    except Exception as e:
+        print(f"⚠️ 底层点击失败: {e}")
+        return False
+
+def click_turnstile(sb) -> bool:
+    if _click_turnstile(sb):
+        return True
+    coords = js(sb, TS_COORDS_JS)
+    if coords:
+        try:
+            if hasattr(sb, "cdp") and hasattr(sb.cdp, "gui_click_x_y"):
+                print(f"🖱️ 坐标点击 Turnstile ({coords['cx']},{coords['cy']})")
+                sb.cdp.gui_click_x_y(int(coords["cx"]), int(coords["cy"]))
+                return True
+        except Exception as e:
+            print(f"⚠️ 坐标点击失败: {e}")
+    try:
+        if hasattr(sb, "cdp") and hasattr(sb.cdp, "click_captcha"):
+            print("🖱️ 兜底调用cdp点击 ...")
+            sb.cdp.click_captcha()
+            return True
+        print("⚠️ 当前 SeleniumBase 版本无 sb.cdp.click_captcha")
+    except Exception as e:
+        print(f"⚠️ click_captcha 出错: {e}")
+    return False
+
+def solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8) -> bool:
+    if turnstile_token(sb):
+        return True
+
+    deadline = time.time() + timeout
+    next_click = time.time() + first_wait
+    clicks = 0
+    while time.time() < deadline:
+        if turnstile_token(sb):
+            print(f"✅ {tag}已通过(已获取 token)")
+            return True
+        if time.time() >= next_click:
+            clicks += 1
+            print(f"🖱️ 第 {clicks} 次点击 Turnstile 验证框...")
+            click_turnstile(sb)
+            next_click = time.time() + 10 + random.uniform(0, 3)
+        time.sleep(2)
+    ok = bool(turnstile_token(sb))
+    print(f"{'✅' if ok else '❌'} {tag}{'已通过' if ok else '未通过'}")
+    return ok
+
+def handle_turnstile(sb) -> bool:
+    print("🛡️ 处理 Turnstile 验证...")
+    return solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8)
+
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
@@ -361,388 +540,206 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
-def do_email_password_login(sb, account) -> bool:
-    """填写邮箱密码、点击 Cloudflare 复选框，验证通过后提交登录。"""
-    if not EMAIL or not BOT_HOSTING_PASSWORD:
-        print("⚠️ 未配置 EMAIL 或 BOT_HOSTING_PASSWORD，跳过邮箱登录")
-        return False
+# 归一化日期为 YYYY/MM/DD
+def normalize_date(date_str: str) -> str:
+    parts = date_str.split('/')
+    if len(parts) == 3:
+        if len(parts[2]) == 4:   # MM/DD/YYYY
+            return f"{parts[2]}/{int(parts[0]):02d}/{int(parts[1]):02d}"
+        if len(parts[0]) == 4:   # YYYY/MM/DD
+            return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
+    return date_str
 
-    print("\n🔑 通过 Bot-hosting 邮箱和密码登录...")
-    try:
-        sb.uc_open_with_reconnect("https://bot-hosting.net/login", reconnect_time=4)
-        sb.wait_for_ready_state_complete()
-        sb.sleep(2)
-        save_login_step_screenshot(sb, account, "01_login_page")
-        network_error = browser_network_error(sb)
-        if network_error:
-            print(f"❌ 登录页面未加载: {network_error}")
-            return False
+DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
 
-        email_selectors = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[autocomplete="email"]',
-            'input[placeholder="Email"]',
-            'input[aria-label="Email"]',
-            'input[type="text"]',
-        ]
-        password_selector = 'input[type="password"]'
-        continue_selector = 'button:contains("Continue with email")'
-        sign_in_selector = 'button:contains("Sign in")'
-
-        def visible_email_selector():
-            for selector in email_selectors:
-                try:
-                    if sb.is_element_visible(selector):
-                        return selector
-                except Exception:
-                    continue
-            return ""
-
-        if not sb.is_element_visible(password_selector):
-            email_selector = visible_email_selector()
-            if not email_selector:
-                sb.wait_for_element_visible(email_selectors[0], timeout=15)
-                email_selector = email_selectors[0]
-            sb.update_text(email_selector, EMAIL)
-            save_login_step_screenshot(sb, account, "02_email_entered")
-            sb.click(continue_selector, timeout=10)
-            save_login_step_screenshot(sb, account, "03_continue_with_email")
-            sb.wait_for_element_visible(password_selector, timeout=15)
-            save_login_step_screenshot(sb, account, "04_password_page")
-
-        email_selector = visible_email_selector()
-        if email_selector and sb.is_element_visible(email_selector):
-            sb.update_text(email_selector, EMAIL)
-        sb.update_text(password_selector, BOT_HOSTING_PASSWORD)
-        save_login_step_screenshot(sb, account, "05_credentials_entered")
-
-        print("⏳ 邮箱和密码已填写，等待 10 秒后点击 Cloudflare 验证框...")
-        sb.sleep(10)
-        save_login_step_screenshot(sb, account, "06_wait_10_seconds")
-
-        turnstile_passed = False
-        for captcha_attempt in range(1, 4):
-            print(f"🔒 点击登录页 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
-            try:
-                sb.uc_gui_click_captcha()
-                save_login_step_screenshot(sb, account, f"07_cloudflare_checkbox_clicked_{captcha_attempt}")
-            except Exception as e:
-                print(f"⚠️ 点击登录页 Cloudflare 验证框出错: {e}")
-
-            if wait_for_turnstile_pass(sb, timeout=30):
-                turnstile_passed = True
-                break
-            if browser_network_error(sb):
-                break
-
-        if not turnstile_passed:
-            save_login_step_screenshot(sb, account, "07_verification_wait_timeout")
-            return False
-
-        save_login_step_screenshot(sb, account, "07_verification_passed")
-        sb.click(sign_in_selector, timeout=10)
-        save_login_step_screenshot(sb, account, "08_sign_in_clicked")
-        for _ in range(60):
-            current_url = sb.get_current_url()
-            parsed_url = urllib.parse.urlparse(current_url)
-            if (
-                parsed_url.hostname in {"bot-hosting.net", "www.bot-hosting.net"}
-                and parsed_url.path != "/login"
-                and not parsed_url.path.startswith("/login/")
-            ):
-                print("✅ 邮箱和密码登录成功")
-                save_login_step_screenshot(sb, account, "09_login_success")
-                return True
-            # 有些前端会先更新会话状态，再由后续导航改变 URL。
-            # 账单页访问会再次确认会话是否有效。
-            if not sb.is_element_visible(password_selector):
-                print("ℹ️ 登录表单已关闭，将通过打开账单页确认登录状态")
-                save_login_step_screenshot(sb, account, "09_login_form_closed")
-                return True
-            time.sleep(0.5)
-
-        current_url = sb.get_current_url()
-        parsed_url = urllib.parse.urlparse(current_url)
-        print(
-            "❌ 邮箱登录未完成："
-            f"页面路径仍为 {parsed_url.path or '/'}，"
-            f"密码框仍显示={sb.is_element_visible(password_selector)}"
-        )
-        feedback = get_login_feedback(sb)
-        if feedback:
-            for message in feedback:
-                print(f"🔎 登录页面提示: {message}")
-        else:
-            print("🔎 页面没有提供可识别的登录错误提示；请检查账号密码或登录页截图")
-        save_login_step_screenshot(sb, account, "09_login_failed")
-        return False
-    except Exception as e:
-        print(f"❌ 邮箱和密码登录失败: {e}")
-        try:
-            save_login_step_screenshot(sb, account, "error")
-        except Exception:
-            pass
-        return False
-
-
-def get_login_feedback(sb):
-    """读取页面上的可见错误提示，不读取或记录输入框内容。"""
-    try:
-        # JSON 字符串在两种执行方式下都能直接返回，避免数组触发 WebDriver 回退。
-        messages = json.loads(sb.evaluate(
-            """
-            JSON.stringify((() => {
-              const selectors = [
-                '[role="alert"]', '[aria-live="assertive"]',
-                '[data-sonner-toast]', '[class*="error" i]'
-              ];
-              const nodes = [...new Set(selectors.flatMap(s => [...document.querySelectorAll(s)]))];
-              return nodes
-                .filter(el => {
-                  const style = getComputedStyle(el);
-                  return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length;
-                })
-                .map(el => (el.innerText || '').trim())
-                .filter(Boolean)
-                .slice(0, 6);
-            })())
-            """
-        ) or "[]")
-        safe_messages = []
-        for message in messages:
-            sanitized = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email]", str(message))
-            sanitized = re.sub(r"\s+", " ", sanitized).strip()[:240]
-            if sanitized and sanitized not in safe_messages:
-                safe_messages.append(sanitized)
-        return safe_messages
-    except Exception:
-        return []
-
-
-def find_renew_control(sb):
-    """查找续期按钮或倒计时，返回 (按钮选择器, 倒计时)。"""
-    possible_selectors = [
-        'button:contains("Renew")',
-        'button:contains("Renew free plan")',
-        'a:contains("Renew")',
-        '[class*="renew"]',
-        '[class*="Renew"]',
+# 获取过期日期
+DATE_RE = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})"
+def extract_expiry_date(page_source: str) -> str:
+    patterns = [
+        r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # 优先匹配包含 "Expires" 的
+        DATE_RE,                                # 兜底匹配
     ]
 
-    for selector in possible_selectors:
+    for pattern in patterns:
+        match = re.search(pattern, page_source)
+        if match:
+            # match.group(1) 现在能准确拿到完整的日期字符串
+            return normalize_date(match.group(1))
+
+    return None
+
+# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+def get_expiry_from_dom(sb) -> str:
+    for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
         try:
-            if not sb.is_element_visible(selector):
-                continue
-
-            button_text = sb.get_text(selector)
-            countdown = extract_renewal_countdown(button_text)
-            if countdown:
-                return None, countdown
-
-            button_text_lower = button_text.lower()
-            if "renew" in button_text_lower and "cooldown" not in button_text_lower:
-                print(f"✅ 续期按钮可用: '{button_text}'")
-                return selector, None
+            if sb.is_element_present(selector):
+                match = re.search(DATE_RE, sb.get_text(selector))
+                if match:
+                    return normalize_date(match.group(1))
         except Exception:
-            # 某个候选选择器失效不应影响后续选择器的检查。
-            continue
+            pass
+    return None
 
-    # Bot-hosting 当前账单页显示的是 “Renewal cooldown HH:MM:SS”，
-    # 其结构不一定会被上面的按钮选择器匹配到，因此再从整页文本识别一次。
+# 登录和续期流程移植自 eooce/Auto-Renew-Bothosting@3835a43。
+# 返回结构化结果，供本项目的多账号、截图通知和 Worker 调度使用。
+def do_email_password_login(sb, account) -> bool:
+    """按上游最新版打开邮箱表单、填写凭据并提交登录。"""
     try:
-        countdown = extract_renewal_countdown(sb.get_page_source())
-        if countdown:
-            return None, countdown
-    except Exception:
-        pass
+        print(f"🌐 访问 {BASE_URL}/login")
+        sb.open(f"{BASE_URL}/login")
+        sb.wait_for_ready_state_complete()
+        sb.sleep(3)
+        # 保留 VPNGate 的网络错误识别，让外层能够重建直连会话。
+        if browser_network_error(sb):
+            return False
+        sb.click('button[type="submit"]')
+        sb.sleep(12)
+        print("📧 填写邮箱...")
+        sb.input('input[type="email"]', account["email"])
+        sb.sleep(1)
+        print("🔑 填写密码...")
+        sb.input('input[type="password"]', account["password"])
+        sb.sleep(3)
 
-    return None, None
-
-
-def extract_renewal_countdown(page_text: str):
-    """从可见文本或 HTML 中识别 Bot-hosting 的续期冷却倒计时。"""
-    plain_text = html.unescape(re.sub(r"<[^>]*>", " ", page_text or ""))
-    match = re.search(
-        r"\b(?:renew\s+in|renewal\s+cooldown)\s*:?[ \t]*(\d{1,2}:\d{2}:\d{2})\b",
-        plain_text,
-        re.IGNORECASE,
-    )
-    return match.group(1) if match else None
-
-
-def wait_for_renewal_countdown(sb, timeout=45):
-    """轮询续期结果，允许代理和页面渲染延迟，不重复提交续期请求。"""
-    deadline = time.monotonic() + timeout
-    while True:
-        countdown = extract_renewal_countdown(sb.get_page_source())
-        if countdown:
-            return countdown
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        sb.sleep(min(1, remaining))
+        if wait_turnstile_present(sb):
+            if not handle_turnstile(sb):
+                print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
+                try:
+                    sb.cdp.click_captcha()
+                    sb.sleep(4)
+                except Exception as exc:
+                    print(f"⚠️ 兜底点击失败: {exc}")
+        else:
+            print("ℹ️ 未检测到 Turnstile")
+        sb.sleep(1)
+        sb.click('button[type="submit"]')
+        print("🖱️ 提交登录按钮")
+        sb.sleep(6)
+        sb.wait_for_ready_state_complete()
+        # 与上游一样，由后续账单页导航确认实际登录结果。
+        return True
+    except Exception as exc:
+        print(f"❌ Password 登录过程异常: {type(exc).__name__}: {str(exc)[:150]}")
+        return False
 
 
 def open_billings_page(sb) -> bool:
-    """登录后或续期重试前打开账单页，兼容新旧后台路径。"""
-    billings_url = "https://bot-hosting.net/dash/billings"
+    """按上游最新版导航到账单页并确认登录状态。"""
     try:
-        print(f"🌐 访问账单页 {billings_url} ...")
-        sb.open(billings_url)
+        sb.open(f"{BASE_URL}/dash/billings")
         sb.wait_for_ready_state_complete()
         sb.sleep(3)
         current_url = sb.get_current_url()
-        current_title = sb.get_title()
-        print(f"📝 账单页面 URL: {current_url}, Title: {current_title}")
-        # 旧地址 /a/billings 会跳转到 /dash/billings，不能再只匹配旧地址。
-        parsed_url = urllib.parse.urlparse(current_url)
-        return (
-            parsed_url.hostname in {"bot-hosting.net", "www.bot-hosting.net"}
-            and parsed_url.path.rstrip("/") in {"/dash/billings", "/a/billings"}
-            and "error" not in urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
-        )
-    except Exception as e:
-        print(f"❌ 重新打开账单页失败: {e}")
+        print(f"📝 当前URL: {current_url}, Title: {sb.get_title()}")
+        return "/dash/billings" in current_url and "/login" not in current_url and "error=" not in current_url
+    except Exception as exc:
+        print(f"❌ 打开账单页失败: {exc}")
         return False
 
 
-def attempt_renewal(sb, attempt_number: int, previous_attempt=False):
-    """执行一次完整续期尝试，返回 success / not_due / failed 结果。"""
-    print(f"🔄 开始第 {attempt_number} 次续期尝试")
+def renew_current_page(sb):
+    """执行上游最新版的单次续期；仅将通知转换为调度所需的结果。"""
+    sb.sleep(3)
+    try:
+        page_source = sb.get_page_text() + "\n" + sb.get_page_source()
+    except Exception:
+        page_source = sb.get_page_source()
+    current_expiry = get_expiry_from_dom(sb) or extract_expiry_date(page_source)
+    if current_expiry:
+        print(f"📅 当前到期日期: {current_expiry}")
+    else:
+        print("⚠️ 未能提取当前到期日期")
 
-    outer_renew_selector, countdown_text = find_renew_control(sb)
-    if countdown_text:
-        extra = f"⏱️ 可续期时间: {format_countdown(countdown_text)}后"
-        if previous_attempt:
-            # 第一次点击后刷新页面已出现倒计时，说明第一次其实已经生效。
-            print(f"✅ 页面已显示续期倒计时，确认续期已生效: {countdown_text}")
-            return {
-                "status": "success",
-                "extra": f"续期已生效，{extra}",
-                "countdown": countdown_text,
-            }
-        return {"status": "not_due", "extra": extra, "countdown": countdown_text}
+    outer_renew_selector = None
+    countdown_text = None
+    possible_selectors = [
+        'type:button("Renew free plan")',
+        'button:contains("Renew free plan")',
+        '[class*="btn btn-primary btn-sm"]',
+    ]
+    for selector in possible_selectors:
+        try:
+            if sb.is_element_visible(selector):
+                button_text = sb.get_text(selector)
+                match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
+                if match:
+                    countdown_text = match.group(1)
+                    print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
+                    break
+                elif "Renew" in button_text:
+                    outer_renew_selector = selector
+                    print(f"✅ 续期按钮可用: '{button_text}'")
+                    break
+        except Exception:
+            pass
 
     if not outer_renew_selector:
-        return {"status": "failed", "error": "未找到续期按钮，页面状态未知"}
+        if countdown_text:
+            return {
+                "status": "not_due", "countdown": countdown_text,
+                "extra": f"⏱️ 可续期时间: {format_countdown(countdown_text)}后",
+                "expiry_date": current_expiry or "（未获取到）",
+            }
+        # 上游的“状态未知”映射为失败，供 Worker 安排后续检查。
+        return {"status": "failed", "error": "未找到续期按钮或倒计时，当前状态未知，请手动检查"}
 
     print("🔄 点击外部续期按钮，等待验证窗口...")
-    submit_selector = 'button:contains("Renew for 4 days")'
     try:
+        sb.sleep(2)
         sb.click(outer_renew_selector)
-        sb.wait_for_element_visible(submit_selector, timeout=30)
-        # 按钮通常先于跨域验证框出现，留出渲染和自动验证的时间。
-        print("⏳ 续期弹窗已打开，等待 5 秒让验证组件加载...")
-        sb.sleep(5)
-    except Exception as e:
-        print(f"❌ 点击外部按钮失败: {e}")
-        return {
-            "status": "failed",
-            "error": f"打开续期弹窗失败: {e}",
-            "screenshot": save_renewal_screenshot(sb, attempt_number),
-        }
+        sb.sleep(15)
+    except Exception as exc:
+        print(f"❌ 点击外部按钮失败: {exc}")
+        return {"status": "failed", "error": "点击外部续期按钮出错"}
 
-    # 处理弹窗中的 Turnstile
-    print("🔒 检测弹窗中的 Turnstile 验证...")
-    turnstile_passed = False
-    for captcha_attempt in range(1, 4):
-        if turnstile_is_ready(sb, submit_selector):
-            print("✅ Cloudflare 验证已通过，续期按钮已启用，无需再次点击验证框")
-            turnstile_passed = True
-            break
-        print(f"🔒 点击续期弹窗 Cloudflare 验证框（第 {captcha_attempt}/3 次）...")
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            print(f"⚠️ 点击 Turnstile 出错: {e}")
-
-        print("⏳ 等待验证完成及续期按钮启用（最多 60 秒）...")
-        if wait_for_turnstile_pass(sb, timeout=60, submit_selector=submit_selector):
-            turnstile_passed = True
-            break
-        if browser_network_error(sb):
-            break
-        if captcha_attempt < 3:
-            print(f"⏳ 第 {captcha_attempt} 次未通过，等待 5 秒后复查，再决定是否重试点击...")
-            sb.sleep(5)
-
+    turnstile_passed = True
+    if wait_turnstile_present(sb):
+        turnstile_passed = handle_turnstile(sb)
+        if not turnstile_passed:
+            print("❌ Turnstile 验证失败，尝试兜底点击...")
+            try:
+                sb.cdp.click_captcha()
+                sb.sleep(4)
+                turnstile_passed = bool(turnstile_token(sb))
+            except Exception as exc:
+                print(f"⚠️ 兜底点击失败: {exc}")
+    else:
+        print("ℹ️ 未检测到 Turnstile")
     if not turnstile_passed:
-        print("❌ Turnstile 验证最终未通过")
-        return {
-            "status": "failed",
-            "error": "续期弹窗 Turnstile 未通过或续期按钮未启用，未提交续期",
-            "screenshot": save_renewal_screenshot(sb, attempt_number),
-        }
+        return {"status": "failed", "error": "Turnstile 验证未通过"}
 
-    # 点击弹窗中的续期按钮
-    print("⏳ 提交续期...")
+    print("⏳ 等待续期按钮可用并点击...")
+    time.sleep(5)
     try:
-        sb.wait_for_element_clickable(submit_selector, timeout=8)
-        sb.click(submit_selector, timeout=8)
-        print("ℹ️ 已点击续期按钮，等待账单倒计时确认结果")
-    except Exception as e:
-        print(f"❌ 续期按钮点击失败: {e}")
-        return {
-            "status": "failed",
-            "error": f"弹窗续期按钮点击失败: {e}",
-            "screenshot": save_renewal_screenshot(sb, attempt_number),
-        }
+        sb.click('div[role="dialog"] button.btn-primary', timeout=8)
+        print("✅ 已点击续期按钮")
+    except Exception as exc:
+        print(f"续期按钮点击失败: {exc}")
 
-    # 续期成功后会出现新的倒计时；不再读取或比较到期日期。
-    print("⏳ 等待续期倒计时更新（最多 45 秒）...")
+    print("⏳ 等待新的过期时间...")
+    sb.sleep(6)
     try:
-        new_countdown = wait_for_renewal_countdown(sb)
-    except Exception as e:
-        print(f"❌ 读取续期结果失败: {e}")
-        return {
-            "status": "failed",
-            "error": f"读取续期结果失败: {e}",
-            "screenshot": save_renewal_screenshot(sb, attempt_number),
-        }
-
-    renewal_screenshot = save_renewal_screenshot(sb, attempt_number)
-    if new_countdown:
+        new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
+    except Exception:
+        new_page_text = sb.get_page_source()
+    new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+    new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
+    if new_match:
+        new_countdown = new_match.group(1)
         print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-        return {
-            "status": "success",
+        result = {
+            "status": "success", "countdown": new_countdown,
             "extra": f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-            "countdown": new_countdown,
-            "screenshot": renewal_screenshot,
+            "expiry_date": new_expiry or "（未获取到）",
         }
+    elif new_expiry and new_expiry != current_expiry:
+        print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+        result = {"status": "success", "extra": "到期日期已更新", "expiry_date": new_expiry}
+    else:
+        return {"status": "failed", "error": "续期结果未知，到期日期未变化，请手动检查"}
 
-    for message in get_login_feedback(sb):
-        print(f"🔎 续期页面提示: {message}")
-    print("⚠️ 等待 45 秒后仍未出现新的续期倒计时")
-    return {
-        "status": "failed",
-        "error": "续期提交后等待 45 秒，页面仍未出现新的倒计时",
-        "screenshot": renewal_screenshot,
-    }
-
-
-def renew_with_retry(sb):
-    """续期失败时重新加载账单页，并且只额外重跑一次。"""
-    renewal_result = attempt_renewal(sb, attempt_number=1)
-    if renewal_result["status"] != "failed":
-        return renewal_result
-
-    first_error = renewal_result["error"]
-    print(f"⚠️ 第 1 次续期失败: {first_error}")
-    print("🔁 将重新打开账单页并重跑一次续期")
-
-    first_screenshot = renewal_result.get("screenshot", "")
-    if not open_billings_page(sb):
-        return {
-            "status": "failed",
-            "error": f"{first_error}；重试前重新打开账单页失败",
-            "screenshot": first_screenshot,
-        }
-
-    retry_result = attempt_renewal(sb, attempt_number=2, previous_attempt=True)
-    if not retry_result.get("screenshot") and first_screenshot:
-        retry_result["screenshot"] = first_screenshot
-    return retry_result
+    result["screenshot"] = save_renewal_screenshot(sb, attempt_number=1)
+    return result
 
 
 # 为一个账号执行一次浏览器会话。
@@ -777,26 +774,25 @@ def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failure
             print("ℹ️ 本次使用邮箱和密码登录")
 
             step = "renewal"
-            # 明确失败或结果未知时，重新打开账单页后最多再跑一次。
-            renewal_result = renew_with_retry(sb)
+            renewal_result = renew_current_page(sb)
             if renewal_result["status"] not in {"success", "not_due"}:
                 error_msg = renewal_result.get("error", "未知错误")
-                print(f"❌ 重跑后续期仍失败: {error_msg}")
+                print(f"❌ 续期未完成: {error_msg}")
                 return notify_account_failure(
                     sb, account, step, error_msg,
-                    extra="已自动重跑 1 次；截图为本次最后失败页面。",
+                    extra="截图为本次最后失败页面。",
                     notify=not defer_failures,
                 )
 
             if renewal_result["status"] == "success":
                 send_telegram_message(
-                    format_notification("✅ 续期成功", extra=renewal_result.get("extra", "续期已生效")),
+                    format_notification("✅ 续期成功", extra=renewal_result.get("extra", "续期已生效"), expiry_date=renewal_result.get("expiry_date", "")),
                     screenshot_path=renewal_result.get("screenshot", ""),
                 )
             elif renewal_result["status"] == "not_due":
                 print(f"⏳ 未到续期时间: {renewal_result['extra']}")
                 send_telegram_message(
-                    format_notification("⏳ 未到续期时间", extra=renewal_result["extra"]),
+                    format_notification("⏳ 未到续期时间", extra=renewal_result["extra"], expiry_date=renewal_result.get("expiry_date", "")),
                     screenshot_path=renewal_result.get("screenshot", ""),
                 )
 
@@ -875,7 +871,7 @@ def main():
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
-    sb_kwargs = {"uc": True, "headless": headless}
+    sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US"}
 
     if is_proxy:
         print(f"🔗 挂载代理: {proxy_server}")

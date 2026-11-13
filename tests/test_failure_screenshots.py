@@ -86,7 +86,7 @@ class FailureScreenshotTests(unittest.TestCase):
             self.addCleanup(manager.__exit__, None, None, None)
         self.login = self.enter(patch.object(app, "do_email_password_login", return_value=True))
         self.billings = self.enter(patch.object(app, "open_billings_page", return_value=True))
-        self.renew = self.enter(patch.object(app, "renew_with_retry", return_value={"status": "not_due", "extra": "tomorrow"}))
+        self.renew = self.enter(patch.object(app, "renew_current_page", return_value={"status": "not_due", "extra": "tomorrow"}))
 
     def enter(self, manager):
         result = manager.__enter__()
@@ -142,6 +142,7 @@ class FailureScreenshotTests(unittest.TestCase):
         self.browser.page = "last page after failed retry"
         result = self.run_account()
         self.assert_failure_photo(result, "renewal")
+        self.renew.assert_called_once_with(self.browser)
         self.assertEqual(self.sent[0]["image"], b"last page after failed retry")
         self.assertNotEqual(result["screenshot"], "earlier-attempt.png")
 
@@ -193,11 +194,12 @@ class FailureScreenshotTests(unittest.TestCase):
 
     def test_success_keeps_the_existing_result_photo(self):
         Path("success.png").write_bytes(b"successful renewal")
-        self.renew.return_value = {"status": "success", "extra": "renewed", "screenshot": "success.png"}
+        self.renew.return_value = {"status": "success", "extra": "renewed", "expiry_date": "19 Nov 2026", "screenshot": "success.png"}
         result = self.run_account()
         self.assertEqual(result["status"], "success")
         self.assertEqual(self.sent[0]["filename"], "success.png")
         self.assertIn("续期成功", self.sent[0]["text"])
+        self.assertIn("到期时间: 19 Nov 2026", self.sent[0]["text"])
         self.assertEqual(list(Path.cwd().glob("failure_*.png")), [])
 
     def test_not_due_sends_the_existing_text_without_a_failure_photo(self):
