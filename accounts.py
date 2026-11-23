@@ -13,6 +13,7 @@ ACCOUNT_DISPLAY_NAMES = {
     "account_2": "karlxu0",
     "account_3": "karlzhe",
 }
+MANUAL_ACCOUNT_ALIASES = {"1": "account_1", "2": "account_2", "3": "account_3"}
 
 
 def format_account_label(account_id):
@@ -60,20 +61,21 @@ def load_accounts():
 
 
 def select_accounts(accounts, raw_ids=None):
-    """接受 Worker 的 JSON 数组或手动输入的逗号/空白分隔 ID；留空处理全部。"""
+    """接受 Worker 的 JSON ID 数组或手动输入的账号编号和 ID，留空处理全部。"""
     if raw_ids is None:
         raw_ids = os.environ.get("SELECTED_ACCOUNT_IDS", "")
     raw_ids = raw_ids.strip()
     if not raw_ids or raw_ids == "null":
         return accounts
 
-    if raw_ids.startswith(("[", "{", '"')):
+    is_json = raw_ids.startswith(("[", "{", '"'))
+    if is_json:
         try:
             selected_ids = json.loads(raw_ids)
         except json.JSONDecodeError as exc:
             raise ValueError("账号选择必须是有效的 JSON 数组，或逗号分隔的账号 ID") from exc
     else:
-        selected_ids = re.split(r"[,\s]+", raw_ids)
+        selected_ids = re.split(r"[,，\s]+", raw_ids)
     if not isinstance(selected_ids, list) or any(not isinstance(item, str) for item in selected_ids):
         raise ValueError("SELECTED_ACCOUNT_IDS 必须是字符串数组，或逗号分隔的账号 ID")
     selected_ids = [item.strip() for item in selected_ids]
@@ -81,6 +83,11 @@ def select_accounts(accounts, raw_ids=None):
         raise ValueError("账号 ID 只能包含字母、数字、下划线或连字符，长度为 1–64")
 
     account_by_id = {account["id"]: account for account in accounts}
+    if not is_json:
+        selected_ids = [
+            account_id if account_id in account_by_id else MANUAL_ACCOUNT_ALIASES.get(account_id, account_id)
+            for account_id in selected_ids
+        ]
     unknown_ids = sorted(set(selected_ids) - account_by_id.keys())
     if unknown_ids:
         raise ValueError(f"触发事件包含未知账号 ID: {', '.join(unknown_ids)}")

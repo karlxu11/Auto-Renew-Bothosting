@@ -89,13 +89,12 @@ SOCKS5 端口只绑定到 `127.0.0.1`，不要改成公网监听。
 
 进入 Actions → Auto Renew Bot-hosting → **Run workflow**，选择 `main` 分支，在 `account_ids` 中填写：
 
-- `account_1`：只处理这个账号；
-- `account_1,account_2`：处理指定的多个账号；
+- `3`：只处理 `karlzhe`；
+- `3,2`（也可用中文逗号 `3，2`）：依次处理 `karlzhe` 和 `karlxu0`；
 - 留空：处理全部已配置账号。
 
-账号 ID 对应 `BOT_HOSTING_ACCOUNTS` 中的 `id`，单账号配置使用 `account_1`。
-Run workflow 的账号输入提示会显示映射：`account_1=karlxu28`、`account_2=karlxu0`、`account_3=karlzhe`。填写时使用账号 ID。
-运行标题会显示指定的账号 ID（手动留空时显示“全部账号”）；运行开始后，“确认本次续期账号”步骤、续期日志和 Summary 会同时显示实际选中的账号 ID 与对应名称。
+Run workflow 的账号输入提示会显示 `1=karlxu28`、`2=karlxu0`、`3=karlzhe`。这三个编号分别对应 `account_1`、`account_2`、`account_3`，也可以直接填写 `BOT_HOSTING_ACCOUNTS` 中配置的账号 ID。单账号配置可填 `1`。
+手动运行的标题会显示输入内容（留空时显示“全部账号”）；运行开始后，“确认本次续期账号”步骤、续期日志和 Summary 会同时显示实际选中的账号 ID 与对应名称。
 账号不存在或输入无效时，会在安装依赖和连接 VPN 之前报错。
 
 **Re-run jobs 会沿用原事件的账号选择和原提交，不能修改账号范围。** 要更换账号或使用刚推送的修复，请从 `main` 分支重新点击 **Run workflow**。
