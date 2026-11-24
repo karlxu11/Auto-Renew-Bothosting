@@ -44,9 +44,15 @@ def connection_snapshot(status: dict):
     return status.get("state"), current.get("hostName"), current.get("ip"), status.get("connectedAt")
 
 
-def probe_proxy(timeout: float, proxy_server: str = PROXY_URL) -> tuple[int, int]:
+def request_proxies(proxy_server: str) -> dict[str, str]:
+    if not proxy_server.strip():
+        raise requests.exceptions.InvalidProxyURL("需要配置代理地址")
     proxy_url = proxy_server.replace("socks5://", "socks5h://", 1)
-    proxies = {"http": proxy_url, "https": proxy_url}
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def probe_proxy(timeout: float, proxy_server: str = PROXY_URL) -> tuple[int, int]:
+    proxies = request_proxies(proxy_server)
     deadline = time.monotonic() + timeout
     codes = []
     with requests.Session() as session:
@@ -63,12 +69,12 @@ def probe_proxy(timeout: float, proxy_server: str = PROXY_URL) -> tuple[int, int
     return codes[0], codes[1]
 
 
-def request_recovery(connection) -> None:
+def request_recovery(connection, timeout: float = 3) -> None:
     """仅回收实际失败的隧道，Runner 已经切换时返回 409。"""
     try:
         with requests.Session() as session:
             session.trust_env = False
-            response = session.post(f"{control_url()}/recover", json={"connectedAt": connection[3]}, timeout=3)
+            response = session.post(f"{control_url()}/recover", json={"connectedAt": connection[3]}, timeout=timeout)
             if response.status_code == 409:
                 print("VPNGate 已开始切换连接，等待代理恢复。", flush=True)
                 return
@@ -82,11 +88,14 @@ def wait_for_connection(timeout: float, proxy_server: str = PROXY_URL, previous=
     deadline = time.monotonic() + timeout
     last_status = None
     last_error = None
+    failed_probes = 0
 
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             status = get_status(timeout=min(3, remaining))
             connection = connection_snapshot(status)
+            if last_status is None or connection != last_status[0]:
+                failed_probes = 0
             state, hostname, ip, connected_at = connection
             node = hostname or ip or "-"
             error = status.get("lastError") or ""
@@ -100,7 +109,16 @@ def wait_for_connection(timeout: float, proxy_server: str = PROXY_URL, previous=
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                login_code, challenge_code = probe_proxy(timeout=min(10, remaining), proxy_server=proxy_server)
+                try:
+                    login_code, challenge_code = probe_proxy(timeout=min(10, remaining), proxy_server=proxy_server)
+                except requests.RequestException:
+                    failed_probes += 1
+                    remaining = deadline - time.monotonic()
+                    if failed_probes == 2 and remaining > 0:
+                        print(f"⚠️ VPNGate 节点 {node} 连续两次未通过代理探测。", flush=True)
+                        request_recovery(connection, timeout=min(3, remaining))
+                    raise
+                failed_probes = 0
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -126,7 +144,7 @@ def main() -> int:
     if wait_for_connection(wait_seconds, poll_seconds=poll_seconds):
         return 0
 
-    print("VPNGate 在限定时间内没有建立可用连接；工作流将回退直连继续续期。", file=sys.stderr)
+    print("VPNGate 在本轮等待时间内未建立可用代理连接。", file=sys.stderr)
     return 1
 
 

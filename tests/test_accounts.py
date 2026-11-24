@@ -122,6 +122,8 @@ class AccountSelectionTests(unittest.TestCase):
             "SCHEDULER_URL": "https://scheduler.example.invalid",
             "SCHEDULER_AUTH_KEY": "test-scheduler-key",
             "IS_PROXY": "false",
+            "PROXY_SERVER": "",
+            "VPNGATE_STARTUP_FAILED": "false",
         }
         output = io.StringIO()
         with patch.dict(os.environ, environment), patch.dict(sys.modules, {"seleniumbase": SimpleNamespace(SB=None)}):
@@ -132,7 +134,7 @@ class AccountSelectionTests(unittest.TestCase):
                 app.main()
         self.assertEqual(renew.call_count, 1)
         self.assertEqual(renew.call_args.args[0]["id"], "account_1")
-        self.assertFalse(renew.call_args.args[3])
+        self.assertEqual(renew.call_args.args[2], app.PROXY_URL)
         self.assertEqual(report.call_args.args[0]["id"], "account_1")
         self.assertIn("account_1（karlxu28）", output.getvalue())
 

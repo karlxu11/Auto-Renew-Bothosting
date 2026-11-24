@@ -24,10 +24,6 @@ jobs:
     permissions:
       actions: write
       contents: read
-    env:
-      IS_PROXY: 'false'
-      PROXY_SERVER: ''
-
     steps:
       - uses: actions/checkout@v6
 
@@ -45,6 +41,7 @@ jobs:
         run: python3 accounts.py
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
+        id: renew_dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
@@ -52,8 +49,6 @@ jobs:
           seleniumbase install chromedriver
 
       - name: 📥 准备 VPNGate SOCKS 服务
-        id: vpngate_prepare
-        continue-on-error: true
         env:
           VPNGATE_TO_SOCKS_REF: 337dbaffbfdf69df65f0fc8bdcf6517e45ca18db
         run: |
@@ -65,9 +60,6 @@ jobs:
           git -C vpngate-to-socks apply "$GITHUB_WORKSPACE/.github/vpngate-recovery.patch"
 
       - name: 🧱 预拉取 VPNGate 构建镜像
-        id: vpngate_images
-        if: steps.vpngate_prepare.outcome == 'success'
-        continue-on-error: true
         run: |
           set -euo pipefail
 
@@ -89,49 +81,34 @@ jobs:
             done
           done
 
-      - name: 🚇 构建并启动 VPNGate SOCKS5 代理
-        id: vpngate_start
-        if: steps.vpngate_images.outcome == 'success'
-        continue-on-error: true
+      - name: 🚇 启动并验证 VPNGate SOCKS5 代理
+        id: vpngate_connect
         env:
           VPNGATE_COUNTRY: JP
           VPNGATE_EXCLUDE_KEYWORD: public
+          VPNGATE_WAIT_SECONDS: '100'
         run: |
           set -euo pipefail
+          compose=(docker compose -p bothosting-vpngate -f .github/vpngate-compose.yml)
           # 基础镜像已经在上一步拉取，构建阶段直接使用本地缓存。
-          docker compose -p bothosting-vpngate \
-            -f .github/vpngate-compose.yml \
-            build
-          docker compose -p bothosting-vpngate \
-            -f .github/vpngate-compose.yml \
-            up -d
+          "${compose[@]}" build
+          for attempt in 1 2 3; do
+            echo "VPNGate 连接尝试 ${attempt}/3"
+            # 复用正在运行的容器，保留 Runner 对故障节点的隔离记录。
+            if "${compose[@]}" up -d && python3 scripts/wait_for_vpngate.py; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+          echo "::error::VPNGate 三轮尝试均未建立可用的代理连接。"
+          exit 1
 
-      - name: 🔎 等待 VPNGate 节点连接
-        id: vpngate_wait
-        if: steps.vpngate_start.outcome == 'success'
-        continue-on-error: true
+      - name: 🚀 续期或回写代理启动失败
+        if: ${{ !cancelled() && steps.renew_dependencies.outcome == 'success' }}
         env:
-          VPNGATE_WAIT_SECONDS: '300'
-        run: |
-          set -euo pipefail
-          python3 scripts/wait_for_vpngate.py
-
-      - name: 🌐 选择续期网络
-        env:
-          VPNGATE_OUTCOME: ${{ steps.vpngate_wait.outcome }}
-        run: |
-          if [ "$VPNGATE_OUTCOME" = "success" ]; then
-            echo "IS_PROXY=true" >> "$GITHUB_ENV"
-            echo "PROXY_SERVER=socks5://127.0.0.1:10080" >> "$GITHUB_ENV"
-            echo "VPNGate 代理已就绪，使用代理继续续期。"
-          else
-            echo "IS_PROXY=false" >> "$GITHUB_ENV"
-            echo "PROXY_SERVER=" >> "$GITHUB_ENV"
-            echo "::warning::VPNGate 准备、启动或连接失败，改用 GitHub Actions runner 直连继续续期。"
-          fi
-
-      - name: 🚀 运行续期脚本
-        env:
+          VPNGATE_STARTUP_FAILED: ${{ steps.vpngate_connect.outcome != 'success' }}
           EMAIL: ${{ secrets.EMAIL }}
           BOT_HOSTING_PASSWORD: ${{ secrets.BOT_HOSTING_PASSWORD }}
           BOT_HOSTING_ACCOUNTS: ${{ secrets.BOT_HOSTING_ACCOUNTS }}
@@ -141,7 +118,11 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -o pipefail
-          xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log
+          if [ "$VPNGATE_STARTUP_FAILED" = "true" ]; then
+            python3 app.py 2>&1 | tee renew.log
+          else
+            xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew.log
+          fi
 
       - name: 🧾 输出 VPNGate 服务日志
         if: always()

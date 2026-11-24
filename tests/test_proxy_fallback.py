@@ -25,116 +25,46 @@ PROXY = "socks5://192.0.2.1:1080"
 VPNGATE = "socks5://127.0.0.1:10080"
 
 
-class ProxyFallbackTests(unittest.TestCase):
+class RequiredProxyTests(unittest.TestCase):
     def setUp(self):
         self.account = {"id": "account_3", "name": "Test account", "email": "test@example.invalid", "password": "test-password"}
-        self.kwargs = {"uc": True, "headless": False, "proxy": PROXY}
-        self.output = io.StringIO()
-        self.stack = contextlib.ExitStack()
-        self.addCleanup(self.stack.close)
-        self.stack.enter_context(contextlib.redirect_stdout(self.output))
-        self.probe = self.stack.enter_context(patch.object(app, "proxy_is_available", return_value=True))
-        self.session = self.stack.enter_context(patch.object(app, "renew_account_once", return_value={"status": "success"}))
-        self.notify = self.stack.enter_context(patch.object(app, "send_saved_failure_notification"))
+        self.kwargs = {"uc": True, "headless": False}
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.probe = stack.enter_context(patch.object(app, "proxy_is_available", return_value=True))
+        self.session = stack.enter_context(patch.object(app, "renew_account_once", return_value={"status": "success"}))
+        self.notify = stack.enter_context(patch.object(app, "send_saved_failure_notification"))
 
-    def run_proxy(self):
-        return app.renew_account(self.account, self.kwargs, PROXY, True)
-
-    def assert_direct_call(self):
-        call = self.session.call_args_list[-1]
-        self.assertEqual(call.args[1], {"uc": True, "headless": False})
-        self.assertEqual(call.args[2:], ("", False))
-        self.assertEqual(self.kwargs["proxy"], PROXY)
-
-    def test_dead_proxy_before_browser_start_skips_proxy_session(self):
+    def test_unavailable_external_proxy_skips_browser(self):
         self.probe.return_value = False
-        result = self.run_proxy()
-        self.assertEqual(self.session.call_count, 1)
-        self.assert_direct_call()
-        self.assertTrue(result["direct_fallback"])
-
-    def test_chrome_proxy_error_recovers_even_if_proxy_has_already_reconnected(self):
-        failed = {"status": "failed", "network_error": "ERR_SOCKS_CONNECTION_FAILED"}
-        self.session.side_effect = [failed, {"status": "success"}]
-        result = self.run_proxy()
-        self.assertEqual(result["status"], "success")
-        self.assertTrue(result["direct_fallback"])
-        self.assertEqual(self.session.call_count, 2)
-        self.assertEqual(self.session.call_args_list[0].kwargs, {"defer_failures": True})
-        self.assert_direct_call()
-        self.probe.assert_called_once()
-        self.notify.assert_not_called()
-
-    def test_failed_login_and_dead_proxy_trigger_direct_retry(self):
-        self.probe.side_effect = [True, False]
-        self.session.side_effect = [{"status": "failed", "network_error": ""}, {"status": "not_due"}]
-        result = self.run_proxy()
-        self.assertEqual(result["status"], "not_due")
-        self.assert_direct_call()
-        self.notify.assert_not_called()
-
-    def test_login_failure_with_healthy_proxy_sends_one_final_notice_without_retry(self):
-        result = {"status": "failed", "network_error": "", "error": "login rejected"}
-        self.session.return_value = result
-        self.assertEqual(self.run_proxy(), result)
-        self.assertEqual(self.session.call_count, 1)
+        result = app.renew_account(self.account, self.kwargs, PROXY)
+        self.assertEqual(result["status"], "failed")
+        self.session.assert_not_called()
         self.notify.assert_called_once_with(self.account, result)
 
-    def test_direct_failure_stops_after_one_fallback(self):
-        self.session.side_effect = [
-            {"status": "failed", "network_error": "ERR_PROXY_CONNECTION_FAILED"},
-            {"status": "failed", "error": "direct login failed"},
-        ]
-        result = self.run_proxy()
-        self.assertEqual(result["status"], "failed")
-        self.assertTrue(result["direct_fallback"])
-        self.assertEqual(self.session.call_count, 2)
+    def test_external_proxy_is_used_for_the_only_browser_session(self):
+        for status in ("success", "failed"):
+            with self.subTest(status=status):
+                self.session.reset_mock()
+                self.session.return_value = {"status": status, "network_error": "ERR_PROXY_CONNECTION_FAILED"}
+                self.assertEqual(app.renew_account(self.account, self.kwargs, PROXY)["status"], status)
+                self.session.assert_called_once_with(self.account, self.kwargs, PROXY)
 
-    def test_successful_proxy_session_does_not_switch_networks(self):
-        result = self.run_proxy()
-        self.assertEqual(result, {"status": "success"})
-        self.assertEqual(self.session.call_count, 1)
-        self.probe.assert_called_once()
-
-    def test_direct_mode_does_not_probe_or_retry_a_proxy(self):
-        self.session.return_value = {"status": "failed"}
-        result = app.renew_account(self.account, {"uc": True}, "", False)
-        self.assertEqual(result["status"], "failed")
-        self.probe.assert_not_called()
-        self.session.assert_called_once()
-
-    def test_proxy_startup_exception_can_recover_with_a_direct_browser(self):
-        self.session.side_effect = [RuntimeError("ERR_SOCKS_CONNECTION_FAILED"), {"status": "success"}]
-        self.assertEqual(self.run_proxy()["status"], "success")
-        self.assert_direct_call()
-
-    def test_unrelated_browser_exception_is_not_hidden_by_a_retry(self):
-        self.session.side_effect = RuntimeError("chromedriver unavailable")
-        with self.assertRaisesRegex(RuntimeError, "chromedriver unavailable"):
-            self.run_proxy()
-        self.assertEqual(self.session.call_count, 1)
-
-    def test_remaining_accounts_use_direct_and_only_final_results_are_reported(self):
-        account_list = [{"id": "account_3"}, {"id": "account_1"}]
-        calls = []
-
-        def renew(account, kwargs, proxy, enabled):
-            calls.append((account["id"], dict(kwargs), proxy, enabled))
-            return {"status": "success", "direct_fallback": True} if enabled else {"status": "not_due"}
-
-        with patch.dict(os.environ, {"IS_PROXY": "true", "PROXY_SERVER": PROXY}), patch.object(
+    def test_startup_failure_reports_every_selected_account_without_opening_a_browser(self):
+        account_list = [self.account, dict(self.account, id="account_1")]
+        with patch.dict(os.environ, {"VPNGATE_STARTUP_FAILED": "true"}), patch.object(
             app, "load_accounts", return_value=account_list
         ), patch.object(app, "select_accounts", side_effect=lambda items: items), patch.object(
             app, "SCHEDULER_URL", "https://scheduler.example.invalid"
         ), patch.object(app, "SCHEDULER_AUTH_KEY", "test-key"), patch.object(
-            app, "renew_account", side_effect=renew
-        ), patch.object(app, "report_account_schedule") as report:
+            app, "renew_account"
+        ) as renew, patch.object(app, "report_account_schedule") as report, self.assertRaises(SystemExit) as raised:
             app.main()
-        self.assertTrue(calls[0][3])
-        self.assertFalse(calls[1][3])
-        self.assertNotIn("proxy", calls[1][1])
-        self.assertEqual(calls[1][2], "")
-        self.assertEqual([call.args[1]["status"] for call in report.call_args_list], ["success", "not_due"])
+        self.assertEqual(raised.exception.code, 1)
+        renew.assert_not_called()
+        self.assertEqual([call.args[0] for call in report.call_args_list], account_list)
+        self.assertEqual([call.args[1]["status"] for call in report.call_args_list], ["failed", "failed"])
 
 
 class VPNGateRecoveryTests(unittest.TestCase):
@@ -143,7 +73,7 @@ class VPNGateRecoveryTests(unittest.TestCase):
 
     def setUp(self):
         self.account = {"id": "account_3", "name": "Test account", "email": "test@example.invalid", "password": "test-password"}
-        self.kwargs = {"uc": True, "proxy": VPNGATE}
+        self.kwargs = {"uc": True}
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -154,7 +84,7 @@ class VPNGateRecoveryTests(unittest.TestCase):
         self.notify = stack.enter_context(patch.object(app, "send_saved_failure_notification"))
 
     def run_vpngate(self):
-        return app.renew_account(self.account, self.kwargs, VPNGATE, True)
+        return app.renew_account(self.account, self.kwargs, VPNGATE)
 
     def test_node_switch_retries_with_a_verified_proxy_connection(self):
         self.snapshot.return_value = self.second
@@ -164,7 +94,7 @@ class VPNGateRecoveryTests(unittest.TestCase):
         self.assertEqual(self.wait.call_args.kwargs["previous"], self.first)
         self.assertEqual([call.kwargs["connection"] for call in self.session.call_args_list], [self.first, self.second])
         for call in self.session.call_args_list:
-            self.assertEqual(call.args[1:], (self.kwargs, VPNGATE, True))
+            self.assertEqual(call.args[1:], (self.kwargs, VPNGATE))
         self.notify.assert_not_called()
 
     def test_recovery_timeout_keeps_the_failure_and_stops_after_one_browser(self):
@@ -244,7 +174,7 @@ class ProxyProbeAndPageTests(unittest.TestCase):
         page.click.assert_not_called()
         page.evaluate.assert_not_called()
 
-    def test_network_error_is_attached_to_the_final_failure_for_direct_recovery(self):
+    def test_network_error_is_attached_to_the_final_failure(self):
         page = Mock()
         page.evaluate.return_value = "ERR_CONNECTION_RESET"
         with patch.object(app, "save_redacted_screenshot", return_value="failure.png"), patch.object(

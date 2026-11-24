@@ -55,13 +55,14 @@ GitHub Actions Secrets 中还需添加 `SCHEDULER_URL`（Worker 的完整 URL）
 - 默认排除节点名称中包含 `public` 的节点；
 - 自动探测 Bot-hosting 连通性，失败后自动切换节点；
 - 未完成握手就退出的节点（包括 `AUTH_FAILED` 后以退出码 0 结束）也会隔离，避免反复连接同一个坏节点；
-- 最多等待连接 300 秒，确认同一条 SOCKS5 隧道能访问 Bot-hosting 登录页和 Cloudflare 验证域名后才启用代理；
-- VPNGate 下载、构建、启动或连接失败时，自动使用 GitHub Actions runner 直连，继续执行登录、续期和调度回写；
+- 工作流启动 VPNGate 最多尝试 3 轮，每轮等待最多 100 秒，轮间间隔 5 秒。确认同一条 SOCKS5 隧道能访问 Bot-hosting 登录页和 Cloudflare 验证域名后才启动续期；
+- 同一条 VPNGate 隧道连续两次未通过代理探测时，请求 Runner 隔离该节点并切换；
+- Bot-hosting 续期必须走代理。VPNGate 准备或连接失败会让 Actions 标红，已选中的账号回写失败状态，Worker 按 6 小时间隔重新调度；
 - 每个账号启动浏览器前会复核 VPNGate 通路。登录或打开账单页时出现浏览器连接超时、网络错误或隧道变化，会关闭原浏览器，最多等待 90 秒确认新连接，再用全新代理浏览器重试一次。恢复超时会结束该账号的执行并回写失败状态；
 - WebDriver 页面加载超时为 20 秒，单条 WebDriver 命令超时为 30 秒。账单页确认后开始续期，进入续期阶段的失败由下一次调度检查；
 - 不再使用 `NODE_LINK` 或远程 sing-box 脚本。
 
-筛选条件可在 `.github/workflows/renew.yml` 的“启动 VPNGate SOCKS5 代理”步骤中修改：
+筛选条件可在 `.github/workflows/renew.yml` 的“启动并验证 VPNGate SOCKS5 代理”步骤中修改：
 
 - `VPNGATE_COUNTRY`：国家代码，默认 `JP`；
 - `VPNGATE_EXCLUDE_KEYWORD`：节点名称排除关键词，默认 `public`。
@@ -124,7 +125,6 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 ## 注意事项
 * 必填变量必须要填写
 * VPNGate 免费节点质量和存活时间不稳定，无法保证每次都能通过 Bot-hosting 的 Cloudflare 验证
-* VPNGate 在工作流启动阶段不可用时会直连尝试续期；直连出口同样可能受到目标站的 Cloudflare 限制
 * 代理浏览器失败时会尽量保留脱敏截图。WebDriver 读超时时直接结束该浏览器会话，Telegram 只通知账号的最终结果，已保存的失败截图保留在 `renew-log` artifact
 * 登录与续期采用上游 `3835a43` 的流程：先点击 Continue with email，再填写邮箱密码，提交后访问 `/dash/billings` 确认登录状态；浏览器语言固定为 `en-US`
 * 验证框沿用上游的 iframe、Shadow DOM 和隐藏 token 父节点定位、系统鼠标点击及 CDP 兜底；出现验证码组件时使用上游的 90 秒处理流程

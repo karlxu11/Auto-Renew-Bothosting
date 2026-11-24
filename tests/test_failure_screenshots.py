@@ -87,6 +87,7 @@ class FailureScreenshotTests(unittest.TestCase):
         ):
             manager.__enter__()
             self.addCleanup(manager.__exit__, None, None, None)
+        self.enter(patch.object(app, "proxy_is_available", return_value=True))
         self.login = self.enter(patch.object(app, "do_email_password_login", return_value=True))
         self.billings = self.enter(patch.object(app, "open_billings_page", return_value=True))
         self.renew = self.enter(patch.object(app, "renew_current_page", return_value={"status": "not_due", "extra": "tomorrow"}))
@@ -110,7 +111,7 @@ class FailureScreenshotTests(unittest.TestCase):
         return SimpleNamespace(ok=ok, status_code=200 if ok else 400, raise_for_status=lambda: None)
 
     def run_account(self, account=None):
-        return app.renew_account(account or self.account, {}, "", False)
+        return app.renew_account(account or self.account, {}, "socks5://192.0.2.1:1080")
 
     def assert_failure_photo(self, result, step):
         self.assertEqual(result["status"], "failed")
@@ -245,7 +246,7 @@ class FailureScreenshotTests(unittest.TestCase):
         with patch.object(app, "wait_for_connection", side_effect=[connection, replacement]), patch.object(
             app, "vpngate_connection_snapshot", side_effect=[connection, replacement, replacement, replacement]
         ), patch.object(app, "request_recovery") as recover:
-            result = app.renew_account(self.account, {"uc": True, "proxy": proxy}, proxy, True)
+            result = app.renew_account(self.account, {"uc": True}, proxy)
         self.assertEqual(result["status"], "not_due")
         recover.assert_called_once_with(connection)
         self.assertEqual([kwargs["proxy"] for kwargs in launches], [proxy, proxy])
@@ -266,7 +267,7 @@ class FailureScreenshotTests(unittest.TestCase):
         with patch.object(app, "wait_for_connection", side_effect=[connection, None]), patch.object(
             app, "vpngate_connection_snapshot", side_effect=[connection, replacement]
         ), patch.object(app, "request_recovery"):
-            result = app.renew_account(self.account, {"uc": True, "proxy": proxy}, proxy, True)
+            result = app.renew_account(self.account, {"uc": True}, proxy)
         self.assertEqual(result["network_error"], "VPNGATE_CONNECTION_CHANGED")
         self.billings.assert_not_called()
         self.renew.assert_not_called()

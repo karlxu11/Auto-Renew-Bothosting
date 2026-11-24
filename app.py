@@ -9,8 +9,8 @@ from seleniumbase import SB
 from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 from accounts import format_account_label, load_accounts, select_accounts
 from scripts.wait_for_vpngate import (
-    LOGIN_URL, connection_snapshot, get_status, is_vpngate_proxy, probe_proxy,
-    request_recovery, wait_for_connection,
+    LOGIN_URL, PROXY_URL, connection_snapshot, get_status, is_vpngate_proxy, probe_proxy,
+    request_proxies, request_recovery, wait_for_connection,
 )
 
 # 通过 GitHub Actions Secrets 等环境变量配置账号信息，不要写入源码。
@@ -544,14 +544,12 @@ def handle_turnstile(sb) -> bool:
     return solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8)
 
 # 获取当前出口ip
-def get_current_ip(proxy_server: str = "") -> str:
-    proxies = None
-    if proxy_server:
-        proxy_url = proxy_server.replace("socks5://", "socks5h://", 1)
-        proxies = {"http": proxy_url, "https": proxy_url}
-    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=5)
-    response.raise_for_status()
-    return response.text.strip()
+def get_current_ip(proxy_server: str) -> str:
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.get("https://api.ip.sb/ip", proxies=request_proxies(proxy_server), timeout=5)
+        response.raise_for_status()
+        return response.text.strip()
 
 # 时间格式化
 def format_countdown(countdown_str: str) -> str:
@@ -780,14 +778,17 @@ def require_vpngate_connection(connection):
 
 
 # 为一个账号执行一次浏览器会话。
-def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failures=False, connection=None):
-    with SB(**sb_kwargs) as sb:
+def renew_account_once(account, sb_kwargs, proxy_server, defer_failures=False, connection=None):
+    if not proxy_server.strip():
+        raise ValueError("续期需要配置代理地址")
+    browser_proxy = proxy_server.replace("socks5h://", "socks5://", 1)
+    with SB(**sb_kwargs, proxy=browser_proxy) as sb:
         step = "login"
         try:
             sb.driver.command_executor.client_config.timeout = WEBDRIVER_TIMEOUT
             sb.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
             try:
-                ip = get_current_ip(proxy_server if is_proxy else "")
+                ip = get_current_ip(proxy_server)
                 print(f"📍 当前出口IP: {ip}", flush=True)
             except Exception as e:
                 print(f"⚠️ 获取出口 IP 失败: {e}")
@@ -847,7 +848,7 @@ def renew_with_vpngate(account, sb_kwargs, proxy_server):
             break
         try:
             result = renew_account_once(
-                account, sb_kwargs, proxy_server, True, defer_failures=True, connection=connection,
+                account, sb_kwargs, proxy_server, defer_failures=True, connection=connection,
             )
         except Exception as exc:
             code = network_error_code(exc)
@@ -874,7 +875,7 @@ def renew_with_vpngate(account, sb_kwargs, proxy_server):
     return result
 
 
-def renew_account(account, sb_kwargs, proxy_server, is_proxy):
+def renew_account(account, sb_kwargs, proxy_server):
     global EMAIL, BOT_HOSTING_PASSWORD, _LOGIN_METHOD, _ACCOUNT_NAME
 
     EMAIL = account["email"]
@@ -882,33 +883,14 @@ def renew_account(account, sb_kwargs, proxy_server, is_proxy):
     _ACCOUNT_NAME = account["name"]
     _LOGIN_METHOD = "Email + Password"
 
-    if not is_proxy:
-        return renew_account_once(account, sb_kwargs, proxy_server, False)
     if is_vpngate_proxy(proxy_server):
         return renew_with_vpngate(account, sb_kwargs, proxy_server)
 
-    use_direct = not proxy_is_available(proxy_server)
-    if not use_direct:
-        try:
-            result = renew_account_once(account, sb_kwargs, proxy_server, True, defer_failures=True)
-        except Exception as exc:
-            if not network_error_code(exc) and proxy_is_available(proxy_server):
-                raise
-            print(f"⚠️ 代理浏览器启动或连接异常: {exc}", flush=True)
-            use_direct = True
-        else:
-            if result.get("status") != "failed":
-                return result
-            use_direct = bool(result.get("network_error")) or not proxy_is_available(proxy_server)
-            if not use_direct:
-                send_saved_failure_notification(account, result)
-                return result
+    if proxy_is_available(proxy_server):
+        return renew_account_once(account, sb_kwargs, proxy_server)
 
-    print(f"⚠️ {format_account_label(account['id'])} 的代理不可用，将用全新浏览器直连重试一次。", flush=True)
-    direct_kwargs = dict(sb_kwargs)
-    direct_kwargs.pop("proxy", None)
-    result = renew_account_once(account, direct_kwargs, "", False)
-    result["direct_fallback"] = True
+    result = {"status": "failed", "failure_step": "代理检查", "error": "代理登录通路未就绪"}
+    send_saved_failure_notification(account, result)
     return result
 
 
@@ -942,35 +924,30 @@ def main():
 
     print(f"🧾 本次选中账号: {', '.join(format_account_label(account['id']) for account in accounts)}")
 
-    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    proxy_server = os.environ.get("PROXY_SERVER", "").strip() or PROXY_URL
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
     sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US", "page_load_strategy": "eager"}
 
-    if is_proxy:
-        print(f"🔗 挂载代理: {proxy_server}")
-        sb_kwargs["proxy"] = proxy_server
+    startup_failed = os.environ.get("VPNGATE_STARTUP_FAILED") == "true"
+    if startup_failed:
+        print("❌ VPNGate 启动或连通性检查失败，本次仅回写选中账号的失败状态。", flush=True)
     else:
-        print("🍭 未使用代理，直连访问")
+        print("🔗 续期使用 VPNGate 代理" if is_vpngate_proxy(proxy_server) else "🔗 续期使用已配置的代理")
 
     failed_accounts = 0
     for index, account in enumerate(accounts, start=1):
         print(f"\n========== 开始续期账号 {index}/{len(accounts)} · {format_account_label(account['id'])} ==========")
         result = {"status": "failed"}
-        try:
-            result = renew_account(account, sb_kwargs, proxy_server, is_proxy) or result
-        except Exception as e:
-            EMAIL = account["email"]
-            BOT_HOSTING_PASSWORD = account["password"]
-            _ACCOUNT_NAME = account["name"]
-            _LOGIN_METHOD = "Email + Password"
-            print(f"❌ 账号 {index} 执行异常: {e}")
-            send_telegram_message(format_notification("❌ 账号续期异常", error=str(e)))
-        if result.get("direct_fallback"):
-            is_proxy = False
-            proxy_server = ""
-            sb_kwargs.pop("proxy", None)
-            print("🌐 本次运行后续账号也将使用直连。", flush=True)
+        if not startup_failed:
+            try:
+                result = renew_account(account, sb_kwargs, proxy_server) or result
+            except Exception as e:
+                EMAIL = account["email"]
+                BOT_HOSTING_PASSWORD = account["password"]
+                _ACCOUNT_NAME = account["name"]
+                _LOGIN_METHOD = "Email + Password"
+                print(f"❌ 账号 {index} 执行异常: {e}")
+                send_telegram_message(format_notification("❌ 账号续期异常", error=str(e)))
         report_account_schedule(account, result)
         if result.get("status") == "failed":
             failed_accounts += 1

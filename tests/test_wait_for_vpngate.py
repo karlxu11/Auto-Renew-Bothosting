@@ -47,7 +47,7 @@ class WaitForVPNGateTests(unittest.TestCase):
         with patch.object(waiter, "get_status", return_value=status), patch.object(waiter, "probe_proxy") as probe:
             self.assertEqual(waiter.main(), 1)
         probe.assert_not_called()
-        self.assertIn("回退直连继续续期", self.output.getvalue())
+        self.assertIn("未建立可用代理连接", self.output.getvalue())
         self.assertEqual(self.output.getvalue().count("AUTH_FAILED"), 1)
 
     def test_unreachable_control_api_times_out(self):
@@ -58,9 +58,10 @@ class WaitForVPNGateTests(unittest.TestCase):
     def test_connected_state_requires_working_socks_proxy(self):
         with patch.object(waiter, "get_status", return_value=self.connected), patch.object(
             waiter, "probe_proxy", side_effect=requests.ConnectionError("SOCKS refused")
-        ) as probe:
+        ) as probe, patch.object(waiter, "request_recovery") as recover:
             self.assertEqual(waiter.main(), 1)
         self.assertEqual(probe.call_count, 3)
+        recover.assert_called_once()
         self.assertNotIn("SOCKS5 已就绪", self.output.getvalue())
 
     def test_retries_proxy_until_it_becomes_usable(self):
@@ -99,6 +100,21 @@ class WaitForVPNGateTests(unittest.TestCase):
         ) as probe:
             self.assertEqual(waiter.main(), 0)
         self.assertEqual(probe.call_count, 2)
+
+    def test_two_failed_probes_request_a_new_node_and_verify_it(self):
+        replacement = dict(self.connected, current={"hostName": "node-b"}, connectedAt="second-connection")
+        with patch.object(waiter, "get_status", side_effect=[self.connected, self.connected, replacement, replacement]), patch.object(
+            waiter, "probe_proxy", side_effect=[requests.Timeout("login"), requests.Timeout("challenge"), (200, 403)]
+        ) as probe, patch.object(waiter, "request_recovery") as recover:
+            self.assertEqual(waiter.wait_for_connection(3, poll_seconds=1), waiter.connection_snapshot(replacement))
+        self.assertEqual(probe.call_count, 3)
+        recover.assert_called_once()
+        self.assertEqual(recover.call_args.args[0], waiter.connection_snapshot(self.connected))
+
+    def test_probe_with_an_empty_proxy_makes_no_http_request(self):
+        with patch.object(waiter.requests, "Session") as session, self.assertRaises(requests.exceptions.InvalidProxyURL):
+            waiter.probe_proxy(timeout=2, proxy_server=" ")
+        session.assert_not_called()
 
     def test_recovery_waits_for_a_different_connection_even_on_the_same_node(self):
         replacement = dict(self.connected, connectedAt="second-connection")
