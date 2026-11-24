@@ -2,11 +2,16 @@
 # -*- coding: utf-8 -*-
 
 import os, re, sys, time, json, requests, random, subprocess, ctypes
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from selenium.common.exceptions import TimeoutException
 from seleniumbase import SB
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 from accounts import format_account_label, load_accounts, select_accounts
+from scripts.wait_for_vpngate import (
+    LOGIN_URL, connection_snapshot, get_status, is_vpngate_proxy, probe_proxy,
+    request_recovery, wait_for_connection,
+)
 
 # 通过 GitHub Actions Secrets 等环境变量配置账号信息，不要写入源码。
 EMAIL         = os.environ.get("EMAIL") or ""           # Bot-hosting 登录邮箱，也用于通知
@@ -25,6 +30,9 @@ if not BOT_HOSTING_ACCOUNTS and not (EMAIL and BOT_HOSTING_PASSWORD):
 _LOGIN_METHOD = "Email + Password"
 _ACCOUNT_NAME = ""
 BASE_URL = "https://bot-hosting.net"
+PAGE_LOAD_TIMEOUT = 20
+WEBDRIVER_TIMEOUT = 30
+VPNGATE_RECOVERY_TIMEOUT = 90
 NETWORK_ERROR_CODES = (
     "ERR_SOCKS_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
     "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_TIMED_OUT",
@@ -33,46 +41,51 @@ NETWORK_ERROR_CODES = (
 )
 
 
+class VPNGateConnectionChanged(RuntimeError):
+    pass
+
+
+def network_error_code(error) -> str:
+    cause = error.reason if isinstance(error, MaxRetryError) else error
+    if isinstance(cause, ReadTimeoutError):
+        return "WEBDRIVER_READ_TIMEOUT"
+    if isinstance(error, VPNGateConnectionChanged):
+        return "VPNGATE_CONNECTION_CHANGED"
+    message = str(error)
+    if isinstance(error, TimeoutError) or (
+        isinstance(error, TimeoutException)
+        and any(detail in message.lower() for detail in ("receiving message from renderer", "page load"))
+    ):
+        return "BROWSER_NAVIGATION_TIMEOUT"
+    return next((code for code in NETWORK_ERROR_CODES if code in message), "")
+
+
 def browser_network_error(sb) -> str:
     """只读取可见错误代码，识别 Chrome 网络错误页。"""
     try:
         text = sb.evaluate("(document.body && document.body.innerText) || ''")
         if isinstance(text, str):
-            return next((code for code in NETWORK_ERROR_CODES if code in text), "")
-    except Exception:
-        pass
+            return network_error_code(text)
+    except Exception as exc:
+        if network_error_code(exc):
+            raise
     return ""
 
 
 def proxy_is_available(proxy_server: str) -> bool:
     """复核登录站点和验证域名的代理通路；HTTP 403 也表示网络已连通。"""
-    proxy_url = proxy_server.replace("socks5://", "socks5h://", 1)
     try:
-        with requests.Session() as session:
-            session.trust_env = False
-            for url in ("https://bot-hosting.net/login", "https://challenges.cloudflare.com/"):
-                with session.get(url, proxies={"http": proxy_url, "https": proxy_url}, timeout=8, stream=True, allow_redirects=False):
-                    pass
+        probe_proxy(timeout=10, proxy_server=proxy_server)
         return True
     except requests.RequestException as exc:
         print(f"⚠️ 代理连通性复核失败: {exc}", flush=True)
         return False
 
 
-def vpngate_connection_snapshot(proxy_server: str):
+def vpngate_connection_snapshot():
     """记录本地 Runner 的节点和建连时间，识别验证期间曾断线又恢复的会话。"""
-    proxy = urllib.parse.urlparse(proxy_server)
-    if proxy.hostname not in {"127.0.0.1", "localhost"} or proxy.port != 10080:
-        return None
-    control_url = os.environ.get("VPNGATE_CONTROL_URL", "http://127.0.0.1:18081").rstrip("/")
     try:
-        with requests.Session() as session:
-            session.trust_env = False
-            response = session.get(f"{control_url}/status", timeout=3)
-            response.raise_for_status()
-            status = response.json()
-        current = status.get("current") or {}
-        return (status.get("state"), current.get("hostName"), current.get("ip"), status.get("connectedAt"))
+        return connection_snapshot(get_status())
     except (requests.RequestException, ValueError, AttributeError):
         return None
 
@@ -220,15 +233,23 @@ def save_login_step_screenshot(sb, account, step: str) -> str:
     return save_redacted_screenshot(sb, f"login_{account_id}_{step_id}.png")
 
 
-def notify_account_failure(sb, account, step: str, error: str, extra: str = "", notify: bool = True) -> dict:
+def notify_account_failure(sb, account, step: str, error, extra: str = "", notify: bool = True) -> dict:
     """在浏览器关闭前留存现场；代理恢复期间将通知延后到最终结果。"""
-    network_error = browser_network_error(sb) or next((code for code in NETWORK_ERROR_CODES if code in error), "")
+    network_error = network_error_code(error)
+    if not network_error:
+        try:
+            network_error = browser_network_error(sb)
+        except Exception as exc:
+            network_error = network_error_code(exc)
+    error = f"执行异常: {error}" if isinstance(error, Exception) else error
     if network_error:
         error = f"页面网络错误 {network_error}；{error}"
     account_id = re.sub(r"[^A-Za-z0-9_-]", "_", account.get("id", "account"))
     step_id = re.sub(r"[^A-Za-z0-9_-]", "_", step)
     # 使用唯一文件名，防止截图失败时误用之前的步骤或其他账号的旧图。
-    screenshot_path = save_redacted_screenshot(sb, f"failure_{account_id}_{step_id}_{uuid4().hex}.png")
+    screenshot_path = ""
+    if network_error != "WEBDRIVER_READ_TIMEOUT":
+        screenshot_path = save_redacted_screenshot(sb, f"failure_{account_id}_{step_id}_{uuid4().hex}.png")
     result = {
         "status": "failed", "error": error, "screenshot": screenshot_path, "failure_step": step,
         "failure_extra": extra, "network_error": network_error,
@@ -302,12 +323,16 @@ def js(sb, script, default=None, errors=None):
         result = sb.execute_script(script)
         return default if result is None else result
     except Exception as e:
+        if network_error_code(e):
+            raise
         if errors is not None:
             errors.append(f"execute_script: {type(e).__name__}: {e}")
         try:
             result = sb.cdp.evaluate("(function(){ " + script + " })()")
             return default if result is None else result
         except Exception as e2:
+            if network_error_code(e2):
+                raise
             if errors is not None:
                 errors.append(f"cdp.evaluate: {type(e2).__name__}: {e2}")
             return default
@@ -522,8 +547,9 @@ def handle_turnstile(sb) -> bool:
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
     if proxy_server:
-        proxies = {"http": proxy_server, "https": proxy_server}
-    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        proxy_url = proxy_server.replace("socks5://", "socks5h://", 1)
+        proxies = {"http": proxy_url, "https": proxy_url}
+    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=5)
     response.raise_for_status()
     return response.text.strip()
 
@@ -585,11 +611,10 @@ def get_expiry_from_dom(sb) -> str:
 def do_email_password_login(sb, account) -> bool:
     """按上游最新版打开邮箱表单、填写凭据并提交登录。"""
     try:
-        print(f"🌐 访问 {BASE_URL}/login")
-        sb.open(f"{BASE_URL}/login")
-        sb.wait_for_ready_state_complete()
+        print(f"🌐 访问 {LOGIN_URL}", flush=True)
+        sb.open(LOGIN_URL)
         sb.sleep(3)
-        # 保留 VPNGate 的网络错误识别，让外层能够重建直连会话。
+        # Chrome 网络错误页没有登录表单，交给外层恢复连接。
         if browser_network_error(sb):
             return False
         sb.click('button[type="submit"]')
@@ -608,6 +633,8 @@ def do_email_password_login(sb, account) -> bool:
                     sb.cdp.click_captcha()
                     sb.sleep(4)
                 except Exception as exc:
+                    if network_error_code(exc):
+                        raise
                     print(f"⚠️ 兜底点击失败: {exc}")
         else:
             print("ℹ️ 未检测到 Turnstile")
@@ -615,11 +642,12 @@ def do_email_password_login(sb, account) -> bool:
         sb.click('button[type="submit"]')
         print("🖱️ 提交登录按钮")
         sb.sleep(6)
-        sb.wait_for_ready_state_complete()
         # 与上游一样，由后续账单页导航确认实际登录结果。
         return True
     except Exception as exc:
         print(f"❌ Password 登录过程异常: {type(exc).__name__}: {str(exc)[:150]}")
+        if network_error_code(exc):
+            raise
         return False
 
 
@@ -627,13 +655,17 @@ def open_billings_page(sb) -> bool:
     """按上游最新版导航到账单页并确认登录状态。"""
     try:
         sb.open(f"{BASE_URL}/dash/billings")
-        sb.wait_for_ready_state_complete()
         sb.sleep(3)
         current_url = sb.get_current_url()
         print(f"📝 当前URL: {current_url}, Title: {sb.get_title()}")
-        return "/dash/billings" in current_url and "/login" not in current_url and "error=" not in current_url
+        return (
+            "/dash/billings" in current_url and "/login" not in current_url
+            and "error=" not in current_url and not browser_network_error(sb)
+        )
     except Exception as exc:
         print(f"❌ 打开账单页失败: {exc}")
+        if network_error_code(exc):
+            raise
         return False
 
 
@@ -742,25 +774,25 @@ def renew_current_page(sb):
     return result
 
 
+def require_vpngate_connection(connection):
+    if connection and vpngate_connection_snapshot() != connection:
+        raise VPNGateConnectionChanged("VPNGate 原连接已中断、切换或无法确认")
+
+
 # 为一个账号执行一次浏览器会话。
-def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failures=False):
-    global EMAIL, BOT_HOSTING_PASSWORD
-    global _LOGIN_METHOD, _ACCOUNT_NAME
-
-    EMAIL = account["email"]
-    BOT_HOSTING_PASSWORD = account["password"]
-    _ACCOUNT_NAME = account["name"]
-    _LOGIN_METHOD = "Email + Password"
-
+def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failures=False, connection=None):
     with SB(**sb_kwargs) as sb:
         step = "login"
         try:
+            sb.driver.command_executor.client_config.timeout = WEBDRIVER_TIMEOUT
+            sb.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
             try:
                 ip = get_current_ip(proxy_server if is_proxy else "")
-                print(f"📍 当前出口IP: {ip}")
+                print(f"📍 当前出口IP: {ip}", flush=True)
             except Exception as e:
                 print(f"⚠️ 获取出口 IP 失败: {e}")
 
+            require_vpngate_connection(connection)
             if not (EMAIL and BOT_HOSTING_PASSWORD and do_email_password_login(sb, account)):
                 return notify_account_failure(
                     sb, account, step, "登录页验证或邮箱密码登录未完成，详情见日志和失败截图",
@@ -768,8 +800,10 @@ def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failure
                 )
 
             step = "billings"
+            require_vpngate_connection(connection)
             if not open_billings_page(sb):
                 return notify_account_failure(sb, account, step, "邮箱登录后未能打开账单页", notify=not defer_failures)
+            require_vpngate_connection(connection)
             print("✅ 邮箱和密码登录成功，当前已到达账单页")
             print("ℹ️ 本次使用邮箱和密码登录")
 
@@ -800,32 +834,72 @@ def renew_account_once(account, sb_kwargs, proxy_server, is_proxy, defer_failure
             return renewal_result
         except Exception as e:
             print(f"❌ 账号 {format_account_label(account['id'])} 执行异常: {e}")
-            return notify_account_failure(sb, account, step, f"执行异常: {e}", notify=not defer_failures)
+            return notify_account_failure(sb, account, step, e, notify=not defer_failures)
+
+
+def renew_with_vpngate(account, sb_kwargs, proxy_server):
+    print(f"🔎 复核 VPNGate 登录通路，最长 {VPNGATE_RECOVERY_TIMEOUT} 秒。", flush=True)
+    connection = wait_for_connection(VPNGATE_RECOVERY_TIMEOUT, proxy_server=proxy_server)
+    result = {"status": "failed", "failure_step": "代理检查", "error": "VPNGate 登录通路未就绪"}
+
+    for attempt in range(2):
+        if not connection:
+            break
+        try:
+            result = renew_account_once(
+                account, sb_kwargs, proxy_server, True, defer_failures=True, connection=connection,
+            )
+        except Exception as exc:
+            code = network_error_code(exc)
+            if not code:
+                raise
+            result = {"status": "failed", "failure_step": "浏览器", "error": str(exc), "network_error": code}
+        if result["status"] != "failed":
+            return result
+        if attempt or result.get("failure_step") == "renewal":
+            break
+        if not result.get("network_error") and vpngate_connection_snapshot() == connection:
+            break
+
+        print(f"⚠️ VPNGate 浏览器连接失效，等待可用的新连接，最长 {VPNGATE_RECOVERY_TIMEOUT} 秒。", flush=True)
+        request_recovery(connection)
+        connection = wait_for_connection(VPNGATE_RECOVERY_TIMEOUT, proxy_server=proxy_server, previous=connection)
+        if connection:
+            print(f"🌐 使用 VPNGate 节点 {connection[1] or connection[2]} 启动全新浏览器重试一次。", flush=True)
+        else:
+            result["failure_extra"] = "VPNGate 在限定时间内未恢复可用连接，已结束本次续期。"
+            print(result["failure_extra"], flush=True)
+
+    send_saved_failure_notification(account, result)
+    return result
 
 
 def renew_account(account, sb_kwargs, proxy_server, is_proxy):
-    """代理启动后再次检查；运行中失效时，用全新直连会话最多重跑一次。"""
+    global EMAIL, BOT_HOSTING_PASSWORD, _LOGIN_METHOD, _ACCOUNT_NAME
+
+    EMAIL = account["email"]
+    BOT_HOSTING_PASSWORD = account["password"]
+    _ACCOUNT_NAME = account["name"]
+    _LOGIN_METHOD = "Email + Password"
+
     if not is_proxy:
         return renew_account_once(account, sb_kwargs, proxy_server, False)
+    if is_vpngate_proxy(proxy_server):
+        return renew_with_vpngate(account, sb_kwargs, proxy_server)
 
     use_direct = not proxy_is_available(proxy_server)
     if not use_direct:
-        connection_before = vpngate_connection_snapshot(proxy_server)
         try:
             result = renew_account_once(account, sb_kwargs, proxy_server, True, defer_failures=True)
         except Exception as exc:
-            if not any(code in str(exc) for code in NETWORK_ERROR_CODES) and proxy_is_available(proxy_server):
+            if not network_error_code(exc) and proxy_is_available(proxy_server):
                 raise
             print(f"⚠️ 代理浏览器启动或连接异常: {exc}", flush=True)
             use_direct = True
         else:
             if result.get("status") != "failed":
                 return result
-            connection_after = vpngate_connection_snapshot(proxy_server)
-            connection_changed = bool(connection_before and connection_after and connection_before != connection_after)
-            if connection_changed:
-                print("⚠️ 验证期间 VPNGate 节点或建连时间已变化，原浏览器会话需要重建。", flush=True)
-            use_direct = connection_changed or bool(result.get("network_error")) or not proxy_is_available(proxy_server)
+            use_direct = bool(result.get("network_error")) or not proxy_is_available(proxy_server)
             if not use_direct:
                 send_saved_failure_notification(account, result)
                 return result
@@ -871,7 +945,7 @@ def main():
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
-    sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US"}
+    sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US", "page_load_strategy": "eager"}
 
     if is_proxy:
         print(f"🔗 挂载代理: {proxy_server}")

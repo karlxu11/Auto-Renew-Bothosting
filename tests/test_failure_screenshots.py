@@ -7,7 +7,9 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from urllib3.exceptions import ReadTimeoutError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ with patch.dict(os.environ, {"EMAIL": "test@example.invalid", "BOT_HOSTING_PASSW
 
 class Browser:
     def __init__(self, events):
+        self.driver = Mock()
         self.events = events
         self.closed = False
         self.page = "last failure page"
@@ -222,10 +225,12 @@ class FailureScreenshotTests(unittest.TestCase):
         self.assertTrue(Path(result["screenshot"]).is_file())
         self.assertEqual(self.sent, [])
 
-    def test_proxy_failure_closes_the_old_browser_before_direct_retry_and_notifies_only_final_result(self):
+    def test_vpngate_login_timeout_closes_old_browser_before_proxy_retry(self):
         first = self.browser
-        first.page = "This site can't be reached ERR_SOCKS_CONNECTION_FAILED"
         second = Browser(self.events)
+        connection = ("connected", "node-a", "192.0.2.1", "first-connection")
+        replacement = ("connected", "node-b", "192.0.2.2", "second-connection")
+        proxy = "socks5://127.0.0.1:10080"
         launches = []
 
         def launch(**kwargs):
@@ -236,17 +241,36 @@ class FailureScreenshotTests(unittest.TestCase):
             return second
 
         app.SB.side_effect = launch
-        self.login.side_effect = [False, True]
-        with patch.object(app, "proxy_is_available", return_value=True), patch.object(app, "vpngate_connection_snapshot", return_value=None):
-            result = app.renew_account(self.account, {"uc": True, "proxy": "socks5://127.0.0.1:10080"}, "socks5://127.0.0.1:10080", True)
+        self.login.side_effect = [ReadTimeoutError(None, "/session/test/url", "Read timed out."), True]
+        with patch.object(app, "wait_for_connection", side_effect=[connection, replacement]), patch.object(
+            app, "vpngate_connection_snapshot", side_effect=[connection, replacement, replacement, replacement]
+        ), patch.object(app, "request_recovery") as recover:
+            result = app.renew_account(self.account, {"uc": True, "proxy": proxy}, proxy, True)
         self.assertEqual(result["status"], "not_due")
-        self.assertTrue(result["direct_fallback"])
-        self.assertIn("proxy", launches[0])
-        self.assertNotIn("proxy", launches[1])
+        recover.assert_called_once_with(connection)
+        self.assertEqual([kwargs["proxy"] for kwargs in launches], [proxy, proxy])
+        self.billings.assert_called_once_with(second)
+        self.renew.assert_called_once_with(second)
+        self.assertEqual(first.scripts, [])
+        self.assertEqual(first.driver.command_executor.client_config.timeout, app.WEBDRIVER_TIMEOUT)
+        first.driver.set_page_load_timeout.assert_called_once_with(app.PAGE_LOAD_TIMEOUT)
         self.assertTrue(second.closed)
         self.assertEqual([item["type"] for item in self.sent], ["text"])
         self.assertIn("未到续期时间", self.sent[0]["text"])
-        self.assertEqual(len(list(Path.cwd().glob("failure_account_3_login_*.png"))), 1)
+        self.assertEqual(list(Path.cwd().glob("failure_account_3_login_*.png")), [])
+
+    def test_connection_change_after_login_stops_before_opening_billings(self):
+        connection = ("connected", "node-a", "192.0.2.1", "first-connection")
+        replacement = ("connected", "node-a", "192.0.2.1", "second-connection")
+        proxy = "socks5://127.0.0.1:10080"
+        with patch.object(app, "wait_for_connection", side_effect=[connection, None]), patch.object(
+            app, "vpngate_connection_snapshot", side_effect=[connection, replacement]
+        ), patch.object(app, "request_recovery"):
+            result = app.renew_account(self.account, {"uc": True, "proxy": proxy}, proxy, True)
+        self.assertEqual(result["network_error"], "VPNGATE_CONNECTION_CHANGED")
+        self.billings.assert_not_called()
+        self.renew.assert_not_called()
+        self.assertEqual(len(self.sent), 1)
 
 
 if __name__ == "__main__":

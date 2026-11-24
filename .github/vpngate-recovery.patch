@@ -1,3 +1,160 @@
+diff --git a/internal/runner/api.go b/internal/runner/api.go
+index 759d270..6b1ea4b 100644
+--- a/internal/runner/api.go
++++ b/internal/runner/api.go
+@@ -124,6 +124,26 @@ func NewAPIHandler(logger *log.Logger, runner *Runner) http.Handler {
+ 		writeJSON(w, http.StatusOK, connectResponse{Status: runner.Status()})
+ 	})
+ 
++	mux.HandleFunc("POST /recover", func(w http.ResponseWriter, r *http.Request) {
++		var req struct {
++			ConnectedAt time.Time `json:"connectedAt"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ConnectedAt.IsZero() {
++			http.Error(w, "缺少有效建连时间", http.StatusBadRequest)
++			return
++		}
++		changed, err := runner.recoverConnection(req.ConnectedAt, "续期浏览器报告网络故障")
++		if err != nil {
++			writeJSON(w, http.StatusInternalServerError, connectResponse{Status: runner.Status(), Error: err.Error()})
++			return
++		}
++		if !changed {
++			writeJSON(w, http.StatusConflict, connectResponse{Status: runner.Status()})
++			return
++		}
++		writeJSON(w, http.StatusAccepted, connectResponse{Status: runner.Status()})
++	})
++
+ 	return loggingMiddleware(logger, mux)
+ }
+ 
+diff --git a/internal/runner/autopilot.go b/internal/runner/autopilot.go
+index 03481e0..7de8554 100644
+--- a/internal/runner/autopilot.go
++++ b/internal/runner/autopilot.go
+@@ -277,7 +277,8 @@ func (r *Runner) monitorLoop(ctx context.Context) {
+ }
+ 
+ func (r *Runner) runMonitorCheck(parent context.Context) {
+-	if !r.canProxy() {
++	current, connectedAt := r.currentSnapshot()
++	if current == nil {
+ 		return
+ 	}
+ 
+@@ -292,6 +293,9 @@ func (r *Runner) runMonitorCheck(parent context.Context) {
+ 	}
+ 
+ 	vpnErr, bypassErr := r.runConcurrentMonitorConfirm(parent)
++	if parent.Err() != nil {
++		return
++	}
+ 	if vpnErr == nil {
+ 		r.resetMonitorFailureCount()
+ 		r.markFullMonitorConfirm()
+@@ -300,22 +304,20 @@ func (r *Runner) runMonitorCheck(parent context.Context) {
+ 
+ 	r.logger.Printf("Runner SOCKS 路径探活失败：%v", vpnErr)
+ 	if bypassErr == nil {
+-		current := r.currentSnapshot()
+-		if current != nil {
+-			failures := r.incrementMonitorFailureCount()
+-			threshold := r.autoConfig.MonitorFailureThreshold
+-			if failures < threshold {
+-				r.logger.Printf("Runner 将继续观察当前节点：%s（%s），已连续 SOCKS 探活失败 %d/%d", current.HostName, current.IP, failures, threshold)
+-				return
+-			}
++		failures := r.incrementMonitorFailureCount()
++		threshold := r.autoConfig.MonitorFailureThreshold
++		if failures < threshold {
++			r.logger.Printf("Runner 将继续观察当前节点：%s（%s），已连续 SOCKS 探活失败 %d/%d", current.HostName, current.IP, failures, threshold)
++			return
++		}
+ 
+-			r.resetMonitorFailureCount()
+-			reason := fmt.Sprintf("SOCKS 探活失败，但直连站点 %s 成功", r.autoConfig.MonitorURL)
++		r.resetMonitorFailureCount()
++		reason := fmt.Sprintf("SOCKS 探活失败，但直连站点 %s 成功", r.autoConfig.MonitorURL)
++		changed, err := r.recoverConnection(connectedAt, reason)
++		if err != nil {
++			r.logger.Printf("Runner 自动断开失效节点失败：%v", err)
++		} else if changed {
+ 			r.logger.Printf("Runner 判定节点失效：%s（%s），原因：%s", current.HostName, current.IP, reason)
+-			r.markQuarantine(*current, reason)
+-			if err := r.disconnectForRecovery(); err != nil {
+-				r.logger.Printf("Runner 自动断开失效节点失败：%v", err)
+-			}
+ 		}
+ 		return
+ 	}
+@@ -556,11 +558,13 @@ func newMarkedDialContext(timeout time.Duration, mark int) func(context.Context,
+ }
+ 
+ func (r *Runner) markQuarantine(info ConnectionInfo, reason string) {
+-	key := nodeKey(info.HostName, info.IP)
+-
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
++	r.markQuarantineLocked(info, reason)
++}
+ 
++func (r *Runner) markQuarantineLocked(info ConnectionInfo, reason string) {
++	key := nodeKey(info.HostName, info.IP)
+ 	entry := r.quarantine[key]
+ 	entry.FailureCount++
+ 	entry.LastReason = reason
+@@ -573,35 +577,33 @@ func nodeKey(hostName, ip string) string {
+ 	return strings.TrimSpace(hostName) + "|" + strings.TrimSpace(ip)
+ }
+ 
+-func (r *Runner) currentSnapshot() *ConnectionInfo {
++func (r *Runner) currentSnapshot() (*ConnectionInfo, time.Time) {
+ 	r.mu.RLock()
+ 	defer r.mu.RUnlock()
+ 
+-	if r.current == nil {
+-		return nil
++	if r.state != StateConnected || r.current == nil {
++		return nil, time.Time{}
+ 	}
+-
+-	copied := *r.current
+-	return &copied
++	current := *r.current
++	return &current, r.connectedAt
+ }
+ 
+-func (r *Runner) disconnectForRecovery() error {
++func (r *Runner) recoverConnection(connectedAt time.Time, reason string) (bool, error) {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+-
+-	if r.proc == nil || r.proc.Process == nil {
+-		return nil
++	if !r.autoConfig.Enabled || r.state != StateConnected || r.current == nil || r.proc == nil ||
++		r.proc.Process == nil || !r.connectedAt.Equal(connectedAt) {
++		return false, nil
+ 	}
+-
+-	r.disconnectRequested = true
+-	r.state = StateDisconnecting
+-	r.updatedAt = time.Now()
+-
+ 	if err := r.proc.Process.Signal(syscall.SIGTERM); err != nil {
+ 		if killErr := r.proc.Process.Kill(); killErr != nil {
+-			return fmt.Errorf("自动停止 openvpn 失败: %w", err)
++			return false, fmt.Errorf("自动停止 openvpn 失败: %w", err)
+ 		}
+ 	}
+ 
+-	return nil
++	r.disconnectRequested = true
++	r.state = StateDisconnecting
++	r.updatedAt = time.Now()
++	r.markQuarantineLocked(*r.current, reason)
++	return true, nil
+ }
 diff --git a/internal/runner/runner.go b/internal/runner/runner.go
 index ab3e21f..dbd2296 100644
 --- a/internal/runner/runner.go
@@ -23,15 +180,19 @@ index ab3e21f..dbd2296 100644
  
 diff --git a/internal/runner/runner_recovery_test.go b/internal/runner/runner_recovery_test.go
 new file mode 100644
-index 0000000..5b9af2b
+index 0000000..9c3a863
 --- /dev/null
 +++ b/internal/runner/runner_recovery_test.go
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,132 @@
 +package runner
 +
 +import (
++	"bytes"
++	"encoding/json"
 +	"io"
 +	"log"
++	"net/http"
++	"net/http/httptest"
 +	"os"
 +	"os/exec"
 +	"strings"
@@ -40,6 +201,50 @@ index 0000000..5b9af2b
 +
 +	"vpngate/internal/vpngate"
 +)
++
++func TestRecoverEndpointOnlyReplacesTheFailedConnection(t *testing.T) {
++	logger := log.New(io.Discard, "", 0)
++	socks, err := newSOCKSServer(logger, "127.0.0.1:0", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { socks.Close() })
++	cmd := exec.Command("sleep", "30")
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		_ = cmd.Process.Kill()
++		_ = cmd.Wait()
++	})
++	connectedAt := time.Now()
++	r := &Runner{
++		logger: logger, socks: socks, proc: cmd, state: StateConnected, connectedAt: connectedAt,
++		current:    &ConnectionInfo{HostName: "vpn", IP: "192.0.2.1"},
++		quarantine: make(map[string]nodeHealth),
++		autoConfig: AutoPilotConfig{Enabled: true, BaseQuarantine: time.Minute},
++	}
++	handler := NewAPIHandler(logger, r)
++	recoverAt := func(at time.Time) int {
++		t.Helper()
++		body, err := json.Marshal(map[string]time.Time{"connectedAt": at})
++		if err != nil {
++			t.Fatal(err)
++		}
++		response := httptest.NewRecorder()
++		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/recover", bytes.NewReader(body)))
++		return response.Code
++	}
++	if got := recoverAt(connectedAt.Add(-time.Second)); got != http.StatusConflict || r.state != StateConnected || len(r.quarantine) != 0 {
++		t.Fatalf("stale request: HTTP %d, runner state %s, quarantine %v", got, r.state, r.quarantine)
++	}
++	if got := recoverAt(connectedAt); got != http.StatusAccepted || r.state != StateDisconnecting || r.autoPaused {
++		t.Fatalf("matching request: HTTP %d, runner state %s, auto paused %v", got, r.state, r.autoPaused)
++	}
++	if got := recoverAt(connectedAt); got != http.StatusConflict || r.quarantine["vpn|192.0.2.1"].FailureCount != 1 {
++		t.Fatalf("duplicate request: HTTP %d, quarantine %v", got, r.quarantine)
++	}
++}
 +
 +func TestWaitOpenVPNQuarantinesExitBeforeHandshake(t *testing.T) {
 +	t.Setenv("VPNGATE_COUNTRY", "")

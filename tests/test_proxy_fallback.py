@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,19 +21,19 @@ with patch.dict(os.environ, {"EMAIL": "test@example.invalid", "BOT_HOSTING_PASSW
     SPEC.loader.exec_module(app)
 
 
-PROXY = "socks5://127.0.0.1:10080"
+PROXY = "socks5://192.0.2.1:1080"
+VPNGATE = "socks5://127.0.0.1:10080"
 
 
 class ProxyFallbackTests(unittest.TestCase):
     def setUp(self):
-        self.account = {"id": "account_3", "name": "Test account"}
+        self.account = {"id": "account_3", "name": "Test account", "email": "test@example.invalid", "password": "test-password"}
         self.kwargs = {"uc": True, "headless": False, "proxy": PROXY}
         self.output = io.StringIO()
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(contextlib.redirect_stdout(self.output))
         self.probe = self.stack.enter_context(patch.object(app, "proxy_is_available", return_value=True))
-        self.connection = self.stack.enter_context(patch.object(app, "vpngate_connection_snapshot", return_value=("connected", "node-a", "192.0.2.1", "first-connection")))
         self.session = self.stack.enter_context(patch.object(app, "renew_account_once", return_value={"status": "success"}))
         self.notify = self.stack.enter_context(patch.object(app, "send_saved_failure_notification"))
 
@@ -78,26 +79,6 @@ class ProxyFallbackTests(unittest.TestCase):
         self.assertEqual(self.run_proxy(), result)
         self.assertEqual(self.session.call_count, 1)
         self.notify.assert_called_once_with(self.account, result)
-
-    def test_node_switch_during_verification_retries_even_when_proxy_is_healthy_again(self):
-        self.connection.side_effect = [
-            ("connected", "node-a", "192.0.2.1", "first-connection"),
-            ("connected", "node-b", "192.0.2.2", "second-connection"),
-        ]
-        self.session.side_effect = [{"status": "failed", "network_error": ""}, {"status": "success"}]
-        result = self.run_proxy()
-        self.assertTrue(result["direct_fallback"])
-        self.assert_direct_call()
-        self.notify.assert_not_called()
-
-    def test_reconnect_to_same_node_is_detected_by_connection_time(self):
-        self.connection.side_effect = [
-            ("connected", "node-a", "192.0.2.1", "first-connection"),
-            ("connected", "node-a", "192.0.2.1", "second-connection"),
-        ]
-        self.session.side_effect = [{"status": "failed", "network_error": ""}, {"status": "not_due"}]
-        self.assertTrue(self.run_proxy()["direct_fallback"])
-        self.assert_direct_call()
 
     def test_direct_failure_stops_after_one_fallback(self):
         self.session.side_effect = [
@@ -156,6 +137,68 @@ class ProxyFallbackTests(unittest.TestCase):
         self.assertEqual([call.args[1]["status"] for call in report.call_args_list], ["success", "not_due"])
 
 
+class VPNGateRecoveryTests(unittest.TestCase):
+    first = ("connected", "node-a", "192.0.2.1", "first-connection")
+    second = ("connected", "node-b", "192.0.2.2", "second-connection")
+
+    def setUp(self):
+        self.account = {"id": "account_3", "name": "Test account", "email": "test@example.invalid", "password": "test-password"}
+        self.kwargs = {"uc": True, "proxy": VPNGATE}
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.wait = stack.enter_context(patch.object(app, "wait_for_connection", side_effect=[self.first, self.second]))
+        self.snapshot = stack.enter_context(patch.object(app, "vpngate_connection_snapshot", return_value=self.first))
+        self.recover = stack.enter_context(patch.object(app, "request_recovery"))
+        self.session = stack.enter_context(patch.object(app, "renew_account_once"))
+        self.notify = stack.enter_context(patch.object(app, "send_saved_failure_notification"))
+
+    def run_vpngate(self):
+        return app.renew_account(self.account, self.kwargs, VPNGATE, True)
+
+    def test_node_switch_retries_with_a_verified_proxy_connection(self):
+        self.snapshot.return_value = self.second
+        self.session.side_effect = [{"status": "failed", "failure_step": "login"}, {"status": "success"}]
+        self.assertEqual(self.run_vpngate(), {"status": "success"})
+        self.recover.assert_called_once_with(self.first)
+        self.assertEqual(self.wait.call_args.kwargs["previous"], self.first)
+        self.assertEqual([call.kwargs["connection"] for call in self.session.call_args_list], [self.first, self.second])
+        for call in self.session.call_args_list:
+            self.assertEqual(call.args[1:], (self.kwargs, VPNGATE, True))
+        self.notify.assert_not_called()
+
+    def test_recovery_timeout_keeps_the_failure_and_stops_after_one_browser(self):
+        self.wait.side_effect = [self.first, None]
+        self.session.return_value = {"status": "failed", "failure_step": "login", "network_error": "WEBDRIVER_READ_TIMEOUT"}
+        result = self.run_vpngate()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("未恢复", result["failure_extra"])
+        self.session.assert_called_once()
+        self.notify.assert_called_once_with(self.account, result)
+
+    def test_unavailable_proxy_before_login_skips_the_browser(self):
+        self.wait.side_effect = [None]
+        result = self.run_vpngate()
+        self.assertEqual(result["status"], "failed")
+        self.session.assert_not_called()
+        self.recover.assert_not_called()
+        self.notify.assert_called_once_with(self.account, result)
+
+    def test_non_network_login_failure_does_not_switch_nodes(self):
+        self.session.return_value = {"status": "failed", "failure_step": "login", "error": "login rejected"}
+        result = self.run_vpngate()
+        self.recover.assert_not_called()
+        self.wait.assert_called_once()
+        self.notify.assert_called_once_with(self.account, result)
+
+    def test_network_failure_during_renewal_does_not_replay_renewal(self):
+        self.session.return_value = {"status": "failed", "failure_step": "renewal", "network_error": "WEBDRIVER_READ_TIMEOUT"}
+        result = self.run_vpngate()
+        self.session.assert_called_once()
+        self.recover.assert_not_called()
+        self.notify.assert_called_once_with(self.account, result)
+
+
 class ProxyProbeAndPageTests(unittest.TestCase):
     def test_runner_snapshot_records_node_and_connection_time(self):
         with patch.object(app.requests, "Session") as factory:
@@ -163,20 +206,15 @@ class ProxyProbeAndPageTests(unittest.TestCase):
             session.get.return_value.json.return_value = {
                 "state": "connected", "current": {"hostName": "node-a", "ip": "192.0.2.1"}, "connectedAt": "2026-11-05T10:00:00Z",
             }
-            self.assertEqual(app.vpngate_connection_snapshot(PROXY), ("connected", "node-a", "192.0.2.1", "2026-11-05T10:00:00Z"))
+            self.assertEqual(app.vpngate_connection_snapshot(), ("connected", "node-a", "192.0.2.1", "2026-11-05T10:00:00Z"))
         self.assertFalse(session.trust_env)
         self.assertTrue(session.get.call_args.args[0].endswith("/status"))
-
-    def test_external_proxy_does_not_query_the_local_vpngate_runner(self):
-        with patch.object(app.requests, "Session") as factory:
-            self.assertIsNone(app.vpngate_connection_snapshot("socks5://192.0.2.1:1080"))
-        factory.assert_not_called()
 
     def test_probe_checks_login_and_challenge_domains_using_remote_dns(self):
         with patch.object(app.requests, "Session") as factory:
             session = factory.return_value.__enter__.return_value
             session.get.return_value.__enter__.return_value.status_code = 403
-            self.assertTrue(app.proxy_is_available(PROXY))
+            self.assertTrue(app.proxy_is_available(VPNGATE))
         self.assertFalse(session.trust_env)
         self.assertEqual([call.args[0] for call in session.get.call_args_list], [
             "https://bot-hosting.net/login", "https://challenges.cloudflare.com/",
@@ -196,6 +234,15 @@ class ProxyProbeAndPageTests(unittest.TestCase):
             self.assertFalse(app.do_email_password_login(page, {"id": "account_3"}))
         page.wait_for_element_visible.assert_not_called()
         page.update_text.assert_not_called()
+
+    def test_login_navigation_read_timeout_stops_before_any_form_interaction(self):
+        page = Mock()
+        error = ReadTimeoutError(None, "/session/test/url", "Read timed out. (read timeout=120)")
+        page.open.side_effect = error
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ReadTimeoutError):
+            app.do_email_password_login(page, {"id": "account_3"})
+        page.click.assert_not_called()
+        page.evaluate.assert_not_called()
 
     def test_network_error_is_attached_to_the_final_failure_for_direct_recovery(self):
         page = Mock()
