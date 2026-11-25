@@ -667,13 +667,59 @@ def open_billings_page(sb) -> bool:
         return False
 
 
-def renew_current_page(sb):
-    """执行上游最新版的单次续期；仅将通知转换为调度所需的结果。"""
-    sb.sleep(3)
+RENEW_CONFIRM_JS = r"""
+(() => {
+    const buttons = Array.from(document.querySelectorAll('button')).filter(button =>
+        /^Renew\s+for\s+\d+\s+days?$/i.test(button.innerText.trim()) &&
+        button.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})
+    );
+    if (!buttons.length) return 'missing';
+    if (buttons.length !== 1) return 'ambiguous';
+    const button = buttons[0];
+    if (button.matches(':disabled') || button.closest('[aria-disabled="true"], [inert]') ||
+        getComputedStyle(button).pointerEvents === 'none') {
+        return 'disabled';
+    }
+    button.click();
+    return 'clicked';
+})()
+"""
+
+
+def submit_renewal(sb, timeout=12):
+    errors = {
+        "missing": "未找到可见的 Renew for ... days 确认按钮",
+        "ambiguous": "检测到多个可见的续期确认按钮",
+        "disabled": "续期确认按钮仍不可用",
+    }
+    deadline = time.monotonic() + timeout
+    while True:
+        # 单次 DOM 操作完成定位和触发，避免指针事件被覆盖层接收。
+        state = sb.evaluate(RENEW_CONFIRM_JS)
+        if state == "clicked":
+            return
+        if state not in errors:
+            raise RuntimeError("浏览器未返回续期确认按钮状态")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(errors[state])
+        sb.sleep(min(1, remaining))
+
+
+def billing_page_text(sb) -> str:
     try:
-        page_source = sb.get_page_text() + "\n" + sb.get_page_source()
-    except Exception:
-        page_source = sb.get_page_source()
+        text = sb.get_page_text()
+    except Exception as exc:
+        if network_error_code(exc):
+            raise
+        text = ""
+    return text or sb.get_page_source()
+
+
+def renew_current_page(sb):
+    """执行一次免费计划续期并确认账单页已更新。"""
+    sb.sleep(3)
+    page_source = billing_page_text(sb)
     current_expiry = get_expiry_from_dom(sb) or extract_expiry_date(page_source)
     if current_expiry:
         print(f"📅 当前到期日期: {current_expiry}")
@@ -738,22 +784,27 @@ def renew_current_page(sb):
     if not turnstile_passed:
         return {"status": "failed", "error": "Turnstile 验证未通过"}
 
-    print("⏳ 等待续期按钮可用并点击...")
-    time.sleep(5)
+    print("⏳ 等待续期确认按钮可用...")
     try:
-        sb.click('div[role="dialog"] button.btn-primary', timeout=8)
-        print("✅ 已点击续期按钮")
+        submit_renewal(sb)
+        print("🖱️ 已触发续期确认按钮，等待账单页更新...")
     except Exception as exc:
-        print(f"续期按钮点击失败: {exc}")
+        if network_error_code(exc):
+            raise
+        return {"status": "failed", "error": f"续期确认按钮点击失败: {exc}"}
 
-    print("⏳ 等待新的过期时间...")
-    sb.sleep(6)
-    try:
-        new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
-    except Exception:
-        new_page_text = sb.get_page_source()
-    new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
-    new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
+    deadline = time.monotonic() + 20
+    while True:
+        new_page_text = billing_page_text(sb)
+        new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+        new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text, re.I)
+        if new_match or (current_expiry and new_expiry and new_expiry != current_expiry):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"status": "failed", "error": "已触发续期确认按钮，但账单页到期日期和倒计时均未更新"}
+        sb.sleep(min(2, remaining))
+
     if new_match:
         new_countdown = new_match.group(1)
         print(f"✅ 续期成功！新的倒计时: {new_countdown}")
@@ -762,11 +813,9 @@ def renew_current_page(sb):
             "extra": f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
             "expiry_date": new_expiry or "（未获取到）",
         }
-    elif new_expiry and new_expiry != current_expiry:
+    else:
         print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
         result = {"status": "success", "extra": "到期日期已更新", "expiry_date": new_expiry}
-    else:
-        return {"status": "failed", "error": "续期结果未知，到期日期未变化，请手动检查"}
 
     result["screenshot"] = save_renewal_screenshot(sb, attempt_number=1)
     return result

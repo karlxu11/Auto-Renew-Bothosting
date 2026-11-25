@@ -35,10 +35,19 @@ const widgets = (state.widgets || []).map(widget);
 const shadowWidgets = (state.shadowWidgets || []).map(widget);
 const parents = (state.tokenParents || []).map(widget);
 parents.forEach((el, i) => el.parentElement = parents[i + 1] || null);
+const clicked = [];
+const buttons = (state.renewButtons || []).map((item, index) => ({
+  innerText: item.text,
+  checkVisibility: () => !item.hidden,
+  matches: selector => selector === ':disabled' && item.disabled,
+  closest: () => item.ariaDisabled ? {} : null,
+  click: () => clicked.push(index),
+}));
 const context = vm.createContext({
   document: {
     body: {innerText: state.body || ''},
     querySelectorAll: selector => {
+      if (selector === 'button') return buttons;
       if (selector === '[name="cf-turnstile-response"]' || selector === 'input[name="cf-turnstile-response"]')
         return (state.tokens || []).map(value => ({value}));
       if (selector.includes('iframe[src*=')) return widgets;
@@ -60,6 +69,14 @@ const context = vm.createContext({
   }}},
   getComputedStyle: el => ({display: el.hidden ? 'none' : 'block', visibility: 'visible'}),
 });
+if (state.renewButtons) {
+  const result = vm.runInContext(script, context);
+  if (JSON.stringify(clicked) !== JSON.stringify(state.expectedClicks || [])) {
+    throw new Error(`Unexpected renewal button clicks: ${clicked}`);
+  }
+  process.stdout.write(JSON.stringify(result));
+  process.exit(0);
+}
 // Polling runs repeatedly in the same page: declarations must not leak globally.
 vm.runInContext(script, context);
 const result = vm.runInContext(script, context);
@@ -161,6 +178,28 @@ class BrowserScriptTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 browser = JavaScriptBrowser(mode, body="This site can't be reached ERR_CONNECTION_RESET")
                 self.assertEqual(app.browser_network_error(browser), "ERR_CONNECTION_RESET")
+
+    def test_renewal_confirmation_targets_the_visible_enabled_button_by_label(self):
+        for mode in ("webdriver", "cdp"):
+            with self.subTest(mode=mode):
+                browser = JavaScriptBrowser(mode, expectedClicks=[3], renewButtons=[
+                    {"text": "Renew free plan"},
+                    {"text": "Upgrade"},
+                    {"text": "Renew for 4 days", "hidden": True},
+                    {"text": "Renew for\n4 days"},
+                ])
+                self.assertEqual(browser.evaluate(app.RENEW_CONFIRM_JS), "clicked")
+
+    def test_renewal_confirmation_never_clicks_disabled_or_ambiguous_buttons(self):
+        for buttons, expected in (
+            ([{"text": "Renew for 4 days", "disabled": True}], "disabled"),
+            ([{"text": "Renew for 1 day", "ariaDisabled": True}], "disabled"),
+            ([{"text": "Renew for 4 days"}] * 2, "ambiguous"),
+            ([{"text": "Renew free plan"}], "missing"),
+        ):
+            with self.subTest(expected=expected):
+                browser = JavaScriptBrowser("cdp", renewButtons=buttons)
+                self.assertEqual(browser.evaluate(app.RENEW_CONFIRM_JS), expected)
 
 
 if __name__ == "__main__":

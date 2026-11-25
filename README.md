@@ -130,15 +130,15 @@ https://你的Worker地址/schedules?key=AUTH_KEY的值
 * 验证框沿用上游的 iframe、Shadow DOM 和隐藏 token 父节点定位、系统鼠标点击及 CDP 兜底；出现验证码组件时使用上游的 90 秒处理流程
 * 失败时会在浏览器仍响应的情况下截取最后页面，截图时遮住凭据输入框；无法截图时发送文字说明
 * 每次浏览器会话只执行一轮上游续期流程，VPNGate 登录网络故障可用已复核的新隧道恢复一次
-* 点击外部续期按钮后按上游等待 15 秒，再处理验证并点击 `div[role="dialog"] button.btn-primary`；未检测到验证码组件时沿用上游的直接提交流程
-* 提交续期后按上游等待 6 秒，新倒计时出现或到期日期发生变化时确认成功；结果未知按失败记录并由 Worker 延后检查
+* 点击外部续期按钮后等待 15 秒，再处理验证。脚本按 `Renew for … days` 文案定位确认按钮，最多等待 12 秒，等按钮可用后提交一次
+* 提交续期后最多等待 20 秒，新倒计时出现或账单页到期日期更新时确认成功；结果未知按失败记录并由 Worker 延后检查
 * `renew-log` artifact 包含运行日志、续期截图和最终失败的脱敏截图（不含登录中间步骤截图）；任一账号最终失败会让 Actions 标红，其余账号仍会继续处理并回写调度
 * 请遵守 Bot-hosting 服务条款，合理使用自动续期
 * Worker 每小时检查一次 KV；未到时间的账号不会启动浏览器或 GitHub Actions
 
 ### 上游同步
 
-已合入 `eooce/Auto-Renew-Bothosting` 的 `3835a43`。登录、验证码处理、按钮选择、等待时长和续期结果判断采用上游最新版；Actions runner 同步为 `ubuntu-24.04`。
+已合入 `eooce/Auto-Renew-Bothosting` 的 `3835a43`。登录与验证码处理沿用该版本，Actions runner 使用 `ubuntu-24.04`。续期确认按钮定位和结果等待按当前账单页调整。
 多账号、Cloudflare Worker 调度、VPNGate 和截图通知继续沿用本项目配置；密码 Secret 仍为 `BOT_HOSTING_PASSWORD`（多账号仍用 `BOT_HOSTING_ACCOUNTS`），无需改成上游的 `PASSWORD`。
 上游的续期结果转换为本项目的 `success`、`not_due` 或 `failed` 后回写 Worker。有倒计时时据此安排下次检查；仅到期日期变化的成功结果延后 24 小时检查；失败或状态未知延后 6 小时检查。原先额外的续期重跑和自定义 45 秒结果轮询已移除。
 

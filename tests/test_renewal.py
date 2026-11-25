@@ -22,7 +22,6 @@ with patch.dict(os.environ, {"EMAIL": "test@example.invalid", "BOT_HOSTING_PASSW
 
 
 OUTER = 'button:contains("Renew free plan")'
-SUBMIT = 'div[role="dialog"] button.btn-primary'
 CLASS_OUTER = '[class*="btn btn-primary btn-sm"]'
 
 
@@ -34,12 +33,19 @@ class BillingPage:
         self.clicks = []
         self.sleeps = []
         self.submitted = False
+        self.submit_checks = 0
+        self.submit_states = []
+        self.waited_after_submit = 0
+        self.update_delay = 0
+        self.submit_error = None
         self.click_error = ""
         self.text_error = False
         self.cdp = SimpleNamespace(click_captcha=Mock())
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
+        if self.submitted:
+            self.waited_after_submit += seconds
 
     def is_element_present(self, selector):
         return False
@@ -53,7 +59,9 @@ class BillingPage:
         return self.button
 
     def get_page_source(self):
-        return self.result if self.submitted else "Expires 15 Nov 2026. " + (self.button or "")
+        if self.submitted and self.waited_after_submit >= self.update_delay:
+            return self.result
+        return "Expires 15 Nov 2026. " + (self.button or "")
 
     def get_page_text(self):
         if self.text_error:
@@ -64,31 +72,43 @@ class BillingPage:
         self.clicks.append(selector)
         if selector == self.click_error:
             raise RuntimeError("Click failed")
-        if selector == SUBMIT:
+
+    def evaluate(self, script):
+        if script != app.RENEW_CONFIRM_JS:
+            raise AssertionError("Unexpected browser script")
+        self.submit_checks += 1
+        if self.submit_error is not None:
+            raise self.submit_error
+        state = self.submit_states.pop(0) if self.submit_states else "clicked"
+        if state == "clicked":
+            if self.submitted:
+                raise AssertionError("Renewal was submitted twice")
             self.submitted = True
+        return state
 
 
 class RenewalTests(unittest.TestCase):
     def setUp(self):
+        seconds = iter(range(300))
         for manager in (
             contextlib.redirect_stdout(io.StringIO()),
-            patch.object(app.time, "sleep"),
+            patch.object(app.time, "monotonic", side_effect=seconds),
             patch.object(app, "wait_turnstile_present", return_value=False),
             patch.object(app, "save_renewal_screenshot", return_value="renew_result_1.png"),
         ):
             manager.__enter__()
             self.addCleanup(manager.__exit__, None, None, None)
 
-    def test_latest_modal_selector_and_countdown_confirm_success(self):
+    def test_one_confirmation_and_new_countdown_confirm_success(self):
         page = BillingPage()
         result = app.renew_current_page(page)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["countdown"], "47:59:59")
         self.assertEqual(result["expiry_date"], "19 Nov 2026")
         self.assertEqual(result["screenshot"], "renew_result_1.png")
-        self.assertEqual(page.clicks, [OUTER, SUBMIT])
-        self.assertEqual(page.sleeps, [3, 2, 15, 6])
-        app.time.sleep.assert_called_once_with(5)
+        self.assertEqual(page.clicks, [OUTER])
+        self.assertEqual(page.submit_checks, 1)
+        self.assertEqual(page.sleeps, [3, 2, 15])
 
     def test_updated_expiry_confirms_success_without_a_countdown_as_upstream_does(self):
         result = app.renew_current_page(BillingPage(result="Expires 19 Nov 2026"))
@@ -97,11 +117,11 @@ class RenewalTests(unittest.TestCase):
         self.assertNotIn("countdown", result)
 
     def test_unchanged_expiry_with_no_countdown_remains_a_failed_unknown_result(self):
-        page = BillingPage(result="Expires 15 Nov 2026")
+        page = BillingPage(result="Expires 15 Nov 2026. Renewing now keeps your bots running until 19 Nov 2026.")
         result = app.renew_current_page(page)
         self.assertEqual(result["status"], "failed")
-        self.assertIn("到期日期未变化", result["error"])
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
+        self.assertIn("到期日期和倒计时均未更新", result["error"])
+        self.assertEqual(page.submit_checks, 1)
         app.save_renewal_screenshot.assert_not_called()
 
     def test_cooldown_does_not_click_any_renewal_button(self):
@@ -131,11 +151,30 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(app.renew_current_page(page)["status"], "failed")
         self.assertEqual(page.clicks, [OUTER])
 
-    def test_failed_submit_does_not_claim_success_when_the_page_has_not_changed(self):
+    def test_failed_submit_reports_click_error_and_does_not_retry(self):
         page = BillingPage()
-        page.click_error = SUBMIT
-        self.assertEqual(app.renew_current_page(page)["status"], "failed")
-        self.assertEqual(page.clicks.count(SUBMIT), 1)
+        page.submit_error = RuntimeError("Click failed")
+        result = app.renew_current_page(page)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("续期确认按钮点击失败", result["error"])
+        self.assertEqual(page.submit_checks, 1)
+
+    def test_confirmation_waits_for_enabled_button_and_delayed_result(self):
+        page = BillingPage()
+        page.submit_states = ["missing", "disabled", "clicked"]
+        page.update_delay = 8
+        result = app.renew_current_page(page)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(page.submit_checks, 3)
+        self.assertGreaterEqual(page.waited_after_submit, 8)
+
+    def test_disabled_confirmation_times_out_without_submitting(self):
+        page = BillingPage()
+        page.submit_states = ["disabled"] * 20
+        result = app.renew_current_page(page)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("仍不可用", result["error"])
+        self.assertFalse(page.submitted)
 
     def test_page_source_is_used_if_visible_text_reading_fails(self):
         page = BillingPage()
@@ -162,7 +201,7 @@ class RenewalTests(unittest.TestCase):
             app, "handle_turnstile", return_value=False
         ), patch.object(app, "turnstile_token", return_value=""):
             self.assertEqual(app.renew_current_page(page)["status"], "failed")
-        self.assertNotIn(SUBMIT, page.clicks)
+        self.assertEqual(page.submit_checks, 0)
 
     def test_latest_upstream_date_formats_are_extracted(self):
         for text, expected in (
